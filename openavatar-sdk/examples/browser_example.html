@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<body>
+  <input id="image" type="file" accept="image/*">
+  <input id="audio" type="file" accept="audio/*">
+  <button id="run">Generate</button>
+  <pre id="result"></pre>
+
+  <script type="module">
+    import { OpenAvatarClient } from "../javascript/openavatar-client.js";
+
+    const client = new OpenAvatarClient();
+
+    document.querySelector("#run").onclick = async () => {
+      const image = document.querySelector("#image").files[0];
+      const audio = document.querySelector("#audio").files[0];
+      const job = await client.generateAvatar(image, audio);
+      document.querySelector("#result").textContent =
+        JSON.stringify(job, null, 2);
+    };
+  </script>
+</body>
+</html>

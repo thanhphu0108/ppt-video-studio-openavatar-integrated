@@ -21,6 +21,14 @@ from src.video_export import VideoScene, export_storyboard_video, synthesize_edg
 from src.avatar_api import AvatarApiConfig, check_avatar_api, generate_talking_head
 from src.local_gpu_bridge import local_gpu_bridge, decode_video_result
 
+# OpenAvatar SDK chỉ dùng khi Streamlit chạy hoàn toàn trên máy local.
+# Khi deploy trên Streamlit Cloud, phải dùng Browser Bridge vì Python server
+# trên cloud không thể truy cập localhost của máy người dùng.
+try:
+    from openavatar_sdk import OpenAvatarClient
+except ImportError:
+    OpenAvatarClient = None
+
 ROOT = Path(__file__).parent
 DEFAULT_DICTIONARY = ROOT / "config" / "pronunciation_default.json"
 PROFANITY_CONFIG = ROOT / "config" / "profanity_vi.json"
@@ -67,8 +75,26 @@ def init_state() -> None:
 init_state()
 profanity = ProfanityFilter(PROFANITY_CONFIG)
 
+
+def check_runtime_from_python(base_url: str) -> tuple[bool, dict | str]:
+    """Kiểm tra Runtime bằng Python SDK.
+
+    Chỉ dùng khi app Streamlit chạy local trên cùng máy với OpenAvatar Runtime.
+    Với Streamlit Cloud, dùng `local_gpu_bridge()` để request chạy trong browser.
+    """
+    if OpenAvatarClient is None:
+        return False, (
+            "Chưa cài openavatar-sdk. Cài bằng: "
+            "`python -m pip install -e C:\\Phu\\openavatar-sdk\\python`"
+        )
+    try:
+        client = OpenAvatarClient(base_url=base_url)
+        return True, client.health()
+    except Exception as exc:
+        return False, str(exc)
+
 st.title("🎬 PPT Video Studio")
-st.caption("Chuyển PowerPoint thành video thuyết minh tiếng Việt, có storyboard, từ điển phát âm, phụ đề và intro/outro tùy chỉnh.")
+st.caption("Chuyển PowerPoint thành video thuyết minh tiếng Việt; hỗ trợ OpenAvatar Runtime để nhép môi bằng GPU local khi app chạy trên Streamlit Cloud.")
 
 tab_upload, tab_story, tab_dict, tab_export = st.tabs([
     "1. PowerPoint", "2. Storyboard", "3. Từ điển", "4. Xuất video"
@@ -301,13 +327,79 @@ with tab_export:
             if presenter_mode == "AI nhép môi bằng OpenAvatar Runtime":
                 st.caption("Trình duyệt gửi ảnh và audio trực tiếp tới OpenAvatar Runtime tại máy đang mở app. File không đi qua GPU của Streamlit Cloud.")
                 l1, l2 = st.columns([2, 1])
-                openavatar_runtime_url = l1.text_input("OpenAvatar Runtime URL", value="http://127.0.0.1:8008")
-                avatar_engine = l2.selectbox("Engine local", ["wav2lip", "sadtalker", "musetalk", "liveportrait"], key="local_engine")
-                health_result = local_gpu_bridge(action="health", agent_url=openavatar_runtime_url, request_id="health", key="local_gpu_health")
-                if isinstance(health_result, dict) and health_result.get("ok"):
-                    payload = health_result.get("payload", {})
-                    st.success(f"Đã kết nối: {payload.get('gpu', 'OpenAvatar Runtime')} | CUDA: {payload.get('cuda') or 'không rõ'}")
-                st.info("Cài và chạy `gpu_agent/start_agent.bat` trên máy này trước khi tạo avatar.")
+                openavatar_runtime_url = l1.text_input(
+                    "OpenAvatar Runtime URL",
+                    value="http://127.0.0.1:8008",
+                    help="Runtime chạy trên máy đang mở trình duyệt."
+                )
+                avatar_engine = l2.selectbox(
+                    "Engine local",
+                    ["wav2lip", "sadtalker", "musetalk", "liveportrait"],
+                    key="local_engine",
+                )
+
+                # Bắt buộc dùng Browser Bridge khi app deploy trên Streamlit Cloud.
+                health_result = local_gpu_bridge(
+                    action="health",
+                    agent_url=openavatar_runtime_url,
+                    request_id="health",
+                    key="openavatar_runtime_health",
+                )
+                if isinstance(health_result, dict):
+                    if health_result.get("ok"):
+                        payload = health_result.get("payload", {})
+                        gpu_name = payload.get("gpu", "OpenAvatar Runtime")
+                        free_vram = payload.get("vram_free_gb")
+                        driver = payload.get("driver")
+                        detail = f"Đã kết nối: {gpu_name}"
+                        if free_vram is not None:
+                            detail += f" | VRAM trống: {free_vram} GB"
+                        if driver:
+                            detail += f" | Driver: {driver}"
+                        st.success(detail)
+
+                        engine_items = payload.get("engines") or []
+                        selected = next(
+                            (
+                                item for item in engine_items
+                                if isinstance(item, dict) and item.get("id") == avatar_engine
+                            ),
+                            None,
+                        )
+                        if selected and not selected.get("available"):
+                            st.warning(
+                                f"Engine {avatar_engine} chưa sẵn sàng: "
+                                f"{selected.get('message') or selected.get('missing')}"
+                            )
+                    else:
+                        st.error(
+                            health_result.get(
+                                "error",
+                                "Không kết nối được OpenAvatar Runtime.",
+                            )
+                        )
+
+                with st.expander("Kiểm tra bằng Python SDK khi chạy Streamlit local"):
+                    st.caption(
+                        "Không dùng mục này trên Streamlit Cloud. "
+                        "Python SDK chỉ truy cập được localhost khi Streamlit và Runtime "
+                        "cùng chạy trên một máy."
+                    )
+                    if st.button("Kiểm tra Runtime bằng openavatar-sdk"):
+                        ok, sdk_result = check_runtime_from_python(
+                            openavatar_runtime_url
+                        )
+                        if ok:
+                            st.success("Python SDK đã kết nối Runtime.")
+                            st.json(sdk_result)
+                        else:
+                            st.error(str(sdk_result))
+
+                st.info(
+                    "Trước khi tạo avatar, chạy OpenAvatar Runtime bằng "
+                    "`installer/start_agent.cmd`, rồi kiểm tra "
+                    "`http://127.0.0.1:8008/health`."
+                )
                 avatar_talking_effect = False
             elif presenter_mode == "AI nhép môi qua GPU API":
                 st.caption("App gửi ảnh và audio từng slide tới GPU API, nhận video talking-head rồi ghép vào góc slide.")
@@ -391,7 +483,7 @@ with tab_export:
                 queue = st.session_state.local_avatar_queue
                 if queue:
                     current_slide = queue[0]
-                    st.progress((len(st.session_state.local_avatar_clips)) / max(1, len(st.session_state.local_avatar_audio)), text=f"Đang tạo avatar local cho slide {current_slide}")
+                    st.progress((len(st.session_state.local_avatar_clips)) / max(1, len(st.session_state.local_avatar_audio)), text=f"OpenAvatar Runtime đang tạo avatar cho slide {current_slide}")
                     result = local_gpu_bridge(
                         action="generate", agent_url=openavatar_runtime_url,
                         image_bytes=st.session_state.avatar_upload,
@@ -406,7 +498,7 @@ with tab_export:
                             st.session_state.local_avatar_queue = queue[1:]
                             st.rerun()
                     elif isinstance(result, dict) and result.get("ok") is False:
-                        st.error(result.get("error", "OpenAvatar Runtime thất bại"))
+                        st.error(result.get("error", "OpenAvatar Runtime xử lý thất bại"))
                 elif st.session_state.local_avatar_audio:
                     done = len(st.session_state.local_avatar_clips)
                     total = len(st.session_state.local_avatar_audio)

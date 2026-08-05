@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-05T00:00:00+07:00",
+  "entries": [
+    {"source":"BHYT","pronunciation":"bảo hiểm y tế","category":"Y tế","enabled":true,"whole_word":true,"case_sensitive":true,"created_by":"system"},
+    {"source":"KHTH","pronunciation":"kế hoạch tổng hợp","category":"Bệnh viện","enabled":true,"whole_word":true,"case_sensitive":true,"created_by":"system"},
+    {"source":"CDSS","pronunciation":"hệ thống hỗ trợ quyết định lâm sàng","category":"Công nghệ y tế","enabled":true,"whole_word":true,"case_sensitive":true,"created_by":"system"},
+    {"source":"ICD-10","pronunciation":"I C D mười","category":"Y tế","enabled":true,"whole_word":true,"case_sensitive":false,"created_by":"system"},
+    {"source":"MRI","pronunciation":"M R I","category":"Chẩn đoán hình ảnh","enabled":true,"whole_word":true,"case_sensitive":true,"created_by":"system"},
+    {"source":"SpO2","pronunciation":"S P O hai","category":"Y tế","enabled":true,"whole_word":true,"case_sensitive":false,"created_by":"system"}
+  ]
+}

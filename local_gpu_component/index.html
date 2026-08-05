@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;color:#334155}
+.box{border:1px solid #cbd5e1;border-radius:10px;padding:12px;background:#f8fafc}
+.ok{color:#047857}.err{color:#b91c1c}.muted{color:#64748b;font-size:13px}
+button{border:0;border-radius:8px;padding:9px 14px;background:#2563eb;color:white;cursor:pointer}
+button:disabled{opacity:.55;cursor:not-allowed}
+</style></head>
+<body><div class="box"><div id="status" class="muted">Đang khởi tạo cầu nối OpenAvatar Runtime…</div><button id="run" style="display:none">Thực hiện</button></div>
+<script>
+let args = {};
+const statusEl = document.getElementById('status');
+const runBtn = document.getElementById('run');
+function post(type, data={}) { window.parent.postMessage({isStreamlitMessage:true,type,...data}, '*'); }
+function ready(){ post('streamlit:componentReady',{apiVersion:1}); post('streamlit:setFrameHeight',{height:78}); }
+function value(v){ post('streamlit:setComponentValue',{value:v}); }
+function dataUrlToBlob(dataUrl){ const [head,b64]=dataUrl.split(','); const mime=(head.match(/data:(.*?);/)||[])[1]||'application/octet-stream'; const bin=atob(b64); const arr=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i); return new Blob([arr],{type:mime}); }
+function arrayBufferToBase64(buffer){ const bytes=new Uint8Array(buffer); let binary=''; const chunk=0x8000; for(let i=0;i<bytes.length;i+=chunk){binary+=String.fromCharCode.apply(null,bytes.subarray(i,Math.min(i+chunk,bytes.length)));} return btoa(binary); }
+async function execute(){
+  runBtn.disabled=true; statusEl.className='muted';
+  const base=(args.agent_url||'http://127.0.0.1:8008').replace(/\/$/,'');
+  try{
+    if(args.action==='health'){
+      statusEl.textContent='Đang kiểm tra OpenAvatar Runtime…';
+      const r=await fetch(base+'/health',{method:'GET'}); const payload=await r.json();
+      if(!r.ok) throw new Error(payload.detail||('HTTP '+r.status));
+      statusEl.className='ok'; statusEl.textContent='✓ '+(payload.message||payload.gpu||'OpenAvatar Runtime sẵn sàng');
+      value({ok:true,kind:'health',payload,request_id:args.request_id}); return;
+    }
+    if(args.action==='generate'){
+      statusEl.textContent='Đang gửi ảnh và audio tới OpenAvatar Runtime…';
+      const fd=new FormData();
+      fd.append('image',dataUrlToBlob(args.image_data_url),'avatar.png');
+      fd.append('audio',dataUrlToBlob(args.audio_data_url),'narration.mp3');
+      fd.append('engine',args.engine||'wav2lip');
+
+      const create=await fetch(base+'/avatar/generate',{method:'POST',body:fd});
+      if(!create.ok){ let t=await create.text(); throw new Error(t||('HTTP '+create.status)); }
+      const job=await create.json();
+      if(!job.id) throw new Error('Runtime không trả job_id.');
+
+      statusEl.textContent='Đã xếp hàng. Đang chờ GPU xử lý…';
+      const deadline=Date.now()+30*60*1000;
+      let current=job;
+      while(Date.now()<deadline){
+        await new Promise(resolve=>setTimeout(resolve,1000));
+        const poll=await fetch(base+'/jobs/'+encodeURIComponent(job.id));
+        if(!poll.ok){ let t=await poll.text(); throw new Error(t||('HTTP '+poll.status)); }
+        current=await poll.json();
+        const progress=current.progress??0;
+        statusEl.textContent='OpenAvatar Runtime đang xử lý: '+progress+'%';
+        if(current.status==='failed' || current.status==='cancelled'){
+          throw new Error(current.error||current.message||'Runtime xử lý thất bại.');
+        }
+        if(current.status==='completed') break;
+      }
+      if(current.status!=='completed') throw new Error('Runtime xử lý quá thời gian chờ.');
+
+      statusEl.textContent='Đang tải video avatar từ Runtime…';
+      const download=await fetch(base+'/jobs/'+encodeURIComponent(job.id)+'/download');
+      if(!download.ok){ let t=await download.text(); throw new Error(t||('HTTP '+download.status)); }
+      const buf=await download.arrayBuffer();
+      const ct=(download.headers.get('content-type')||'video/mp4').toLowerCase();
+      statusEl.className='ok'; statusEl.textContent='✓ OpenAvatar Runtime đã tạo xong video avatar.';
+      value({
+        ok:true,
+        kind:'video',
+        video_base64:arrayBufferToBase64(buf),
+        content_type:ct,
+        job_id:job.id,
+        request_id:args.request_id
+      });
+      return;
+    }
+    throw new Error('Action không hợp lệ.');
+  }catch(e){ statusEl.className='err'; statusEl.textContent='Không kết nối được OpenAvatar Runtime: '+e.message; value({ok:false,error:String(e.message||e),request_id:args.request_id}); }
+  finally{runBtn.disabled=false;}
+}
+window.addEventListener('message',e=>{ const d=e.data||{}; if(d.type==='streamlit:render'){ args=d.args||{}; runBtn.style.display='inline-block'; runBtn.textContent=args.action==='health'?'Kiểm tra lại':'Tạo avatar bằng OpenAvatar Runtime'; runBtn.onclick=execute; if(args.action==='health') execute(); else statusEl.textContent='Sẵn sàng gửi dữ liệu tới OpenAvatar Runtime trên máy này.'; post('streamlit:setFrameHeight',{height:88}); }});
+ready();
+</script></body></html>

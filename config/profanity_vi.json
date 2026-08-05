@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "blocked_exact": ["địt", "dit", "đjt", "djt", "đcm", "dcm", "đkm", "dkm", "vcl", "vkl", "đm", "dm"],
+  "blocked_contains": ["địtme", "ditme", "đụmá", "dumá", "đụmẹ", "dume"],
+  "exceptions": ["di", "đi", "các", "buổi", "cut", "lon"]
+}

@@ -1,0 +1,6 @@
+ffmpeg
+libreoffice
+poppler-utils
+fonts-dejavu-core
+fonts-liberation
+fonts-noto-core

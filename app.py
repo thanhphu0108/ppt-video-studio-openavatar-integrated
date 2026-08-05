@@ -110,7 +110,7 @@ with tab_upload:
     with right:
         st.info("App dùng python-pptx để lấy nội dung thuyết minh và dùng LibreOffice để render nguyên hình slide. Nền, ảnh, biểu đồ, SmartArt và bố cục được giữ ở dạng tĩnh; animation và video nhúng không được phát lại.")
 
-    if uploaded and (uploaded.name != st.session_state.ppt_name or not st.session_state.records):
+    if uploaded and (uploaded.name != st.session_state.ppt_name or not st.session_state.records or not st.session_state.original_slide_images or st.session_state.render_backend == "Chưa render"):
         try:
             payload = uploaded.getvalue()
             records = read_pptx(payload)

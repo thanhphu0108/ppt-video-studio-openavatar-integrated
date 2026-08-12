@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import json
+import re
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
@@ -17,9 +18,19 @@ from src.ppt_reader import build_narration, read_pptx
 from src.ppt_renderer import PowerPointRenderError, render_pptx_slides
 from src.pronunciation import apply_dictionary, dictionary_json, load_dictionary, parse_dictionary_bytes, validate_entry
 from src.slide_builder import build_boundary_slide, build_content_slide
-from src.video_export import VideoScene, export_storyboard_video, synthesize_edge_tts_audio
+from src.storyboard_io import (
+    apply_storyboard_updates,
+    prepare_storyboard_updates,
+    read_storyboard_upload,
+    storyboard_csv_bytes,
+    storyboard_xlsx_bytes,
+)
+from src.audio_assets import AudioAsset
+from src.video_export import VideoScene, export_storyboard_video, synthesize_scene_audio
 from src.avatar_api import AvatarApiConfig, check_avatar_api, generate_talking_head
 from src.local_gpu_bridge import local_gpu_bridge, decode_video_result
+from src.voice_clone import VoiceCloneConfig
+from src.voice_access import verify_voice_upload_password
 
 # OpenAvatar SDK chỉ dùng khi Streamlit chạy hoàn toàn trên máy local.
 # Khi deploy trên Streamlit Cloud, phải dùng Browser Bridge vì Python server
@@ -93,6 +104,176 @@ def check_runtime_from_python(base_url: str) -> tuple[bool, dict | str]:
     except Exception as exc:
         return False, str(exc)
 
+
+def ensure_boundary_defaults(records: list[dict]) -> None:
+    """Khởi tạo giá trị biểu mẫu boundary một lần để người dùng không mất lời thoại."""
+
+    first_title = str(records[0].get("title", "")) if records else ""
+    defaults = {
+        "intro_title": first_title,
+        "intro_subtitle": st.session_state.get("organization", ""),
+        "intro_narration": f"Xin chào quý anh chị. Nội dung trình bày hôm nay là {first_title}.",
+        "outro_title": "Trân trọng cảm ơn",
+        "outro_subtitle": st.session_state.get("organization", ""),
+        "outro_narration": "Nội dung trình bày xin được kết thúc tại đây. Trân trọng cảm ơn quý anh chị đã theo dõi.",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_presentation_editing_state() -> None:
+    """Bỏ dữ liệu gắn với PowerPoint cũ trước khi đọc một bài mới."""
+
+    for key in (
+        "intro_title",
+        "intro_subtitle",
+        "intro_narration",
+        "outro_title",
+        "outro_subtitle",
+        "outro_narration",
+        "intro_mode_label",
+        "outro_mode_label",
+        "intro_source_slide",
+        "outro_source_slide",
+        "remove_intro",
+        "remove_outro",
+        "intro_image",
+        "outro_image",
+        "storyboard_editor",
+        "storyboard_import_file",
+        "storyboard_import_notice",
+        "recorded_voice_files",
+        "voice_clone_reference",
+        "voice_clone_endpoint",
+        "voice_clone_model",
+        "voice_clone_api_key",
+        "voice_clone_transcript",
+        "voice_clone_verify_ssl",
+        "voice_clone_consent",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state.intro_upload = None
+    st.session_state.outro_upload = None
+    st.session_state.local_avatar_clips = {}
+    st.session_state.local_avatar_audio = {}
+    st.session_state.local_avatar_queue = []
+
+
+def configured_voice_upload_password() -> str | None:
+    """Cho phép thay mật khẩu ngoài source qua environment hoặc Streamlit secrets."""
+
+    from_environment = os.getenv("VOICE_UPLOAD_PASSWORD", "").strip()
+    if from_environment:
+        return from_environment
+    try:
+        from_secrets = str(st.secrets.get("VOICE_UPLOAD_PASSWORD", "")).strip()
+    except Exception:
+        from_secrets = ""
+    return from_secrets or None
+
+
+def clear_voice_upload_session() -> None:
+    """Khóa lại và bỏ các audio/mẫu giọng đang giữ trong session hiện tại."""
+
+    for key in (
+        "voice_upload_unlocked",
+        "voice_upload_password",
+        "recorded_voice_files",
+        "voice_clone_reference",
+        "voice_clone_endpoint",
+        "voice_clone_model",
+        "voice_clone_api_key",
+        "voice_clone_transcript",
+        "voice_clone_verify_ssl",
+        "voice_clone_consent",
+    ):
+        st.session_state.pop(key, None)
+
+
+def unlock_voice_uploads() -> bool:
+    """Hiển thị cổng mật khẩu trước các chức năng có upload audio giọng."""
+
+    if st.session_state.get("voice_upload_unlocked", False):
+        unlocked_col, lock_col = st.columns([4, 1])
+        unlocked_col.success("Đã mở khóa tính năng tải giọng cho phiên này.")
+        if lock_col.button("Khóa lại", key="lock_voice_uploads", use_container_width=True):
+            clear_voice_upload_session()
+            st.rerun()
+        return True
+
+    password = st.text_input(
+        "Mật khẩu để dùng giọng tải lên",
+        type="password",
+        key="voice_upload_password",
+        help="Cần nhập mật khẩu trước khi tải bản thu thật hoặc mẫu giọng để nhân bản.",
+    )
+    if st.button("Mở khóa tải giọng", key="unlock_voice_uploads", use_container_width=True):
+        if verify_voice_upload_password(
+            password,
+            configured_password=configured_voice_upload_password(),
+        ):
+            st.session_state.voice_upload_unlocked = True
+            st.rerun()
+        else:
+            st.error("Mật khẩu không đúng.")
+    return False
+
+
+def uploaded_audio_assets(files: list[st.runtime.uploaded_file_manager.UploadedFile]) -> tuple[dict[int | str, AudioAsset], list[str]]:
+    """Đọc bản thu theo quy ước slide_001.mp3, intro.mp3 hoặc outro.mp3."""
+
+    assets: dict[int | str, AudioAsset] = {}
+    errors: list[str] = []
+    for uploaded_file in files:
+        stem = Path(uploaded_file.name).stem.lower()
+        normalized = re.sub(r"[^a-z0-9]+", "", stem)
+        if normalized.startswith("intro") or normalized.startswith("modau"):
+            slot: int | str = "intro"
+        elif normalized.startswith("outro") or normalized.startswith("ketthuc"):
+            slot = "outro"
+        else:
+            numbers = re.findall(r"\d+", stem)
+            if not numbers:
+                errors.append(
+                    f"{uploaded_file.name}: đặt tên slide_001.mp3, intro.mp3 hoặc outro.mp3."
+                )
+                continue
+            slot = int(numbers[-1])
+        if slot in assets:
+            errors.append(f"Có nhiều bản thu cùng cho {'slide ' if isinstance(slot, int) else ''}{slot}.")
+            continue
+        payload = uploaded_file.getvalue()
+        if not payload:
+            errors.append(f"{uploaded_file.name}: file audio rỗng.")
+            continue
+        assets[slot] = AudioAsset(data=payload, filename=uploaded_file.name)
+    return assets, errors
+
+
+def audio_asset_for_scene(scene: VideoScene, assets: dict[int | str, AudioAsset]) -> AudioAsset | None:
+    if scene.slide_type in {"intro", "outro"} and scene.slide_type in assets:
+        return assets[scene.slide_type]
+    if scene.source_slide_number is not None:
+        return assets.get(scene.source_slide_number)
+    if scene.slide_number:
+        return assets.get(scene.slide_number)
+    if scene.slide_type in {"intro", "outro"}:
+        return assets.get(scene.slide_type)
+    return None
+
+
+def scene_label(scene: VideoScene) -> str:
+    if scene.slide_type == "intro":
+        return "mở đầu"
+    if scene.slide_type == "outro":
+        return "kết thúc"
+    if scene.source_slide_number:
+        return f"slide {scene.source_slide_number}"
+    if scene.slide_number:
+        return f"slide {scene.slide_number}"
+    return scene.title
+
 st.title("🎬 PPT Video Studio")
 st.caption("Chuyển PowerPoint thành video thuyết minh tiếng Việt; hỗ trợ OpenAvatar Runtime để nhép môi bằng GPU local khi app chạy trên Streamlit Cloud.")
 
@@ -110,33 +291,41 @@ with tab_upload:
     with right:
         st.info("App dùng python-pptx để lấy nội dung thuyết minh và dùng LibreOffice để render nguyên hình slide. Nền, ảnh, biểu đồ, SmartArt và bố cục được giữ ở dạng tĩnh; animation và video nhúng không được phát lại.")
 
-    if uploaded and (uploaded.name != st.session_state.ppt_name or not st.session_state.records or not st.session_state.original_slide_images or st.session_state.render_backend == "Chưa render"):
-        try:
-            payload = uploaded.getvalue()
-            records = read_pptx(payload)
-            for record in records:
-                record["narration"] = apply_dictionary(build_narration(record, style), st.session_state.dictionary)
-                record["skip"] = False
-                record["pause_after"] = 0.35
-            st.session_state.records = records
-            st.session_state.ppt_name = uploaded.name
-            st.session_state.ppt_payload = payload
-            st.session_state.original_slide_images = []
-            st.session_state.render_warning = ""
+    if uploaded:
+        payload = uploaded.getvalue()
+        needs_reload = (
+            uploaded.name != st.session_state.ppt_name
+            or payload != st.session_state.ppt_payload
+            or not st.session_state.records
+        )
+        if needs_reload:
             try:
-                rendered, backend = render_pptx_slides(payload, uploaded.name)
-                if len(rendered) != len(records):
-                    raise PowerPointRenderError(
-                        f"Số ảnh render ({len(rendered)}) khác số slide ({len(records)})."
-                    )
-                st.session_state.original_slide_images = rendered
-                st.session_state.render_backend = backend
-            except Exception as render_exc:
-                st.session_state.render_backend = "Dựng lại từ text"
-                st.session_state.render_warning = str(render_exc)
-            st.success(f"Đã phân tích {len(records)} slide từ {uploaded.name}.")
-        except Exception as exc:
-            st.error(f"Không đọc được PowerPoint: {exc}")
+                if uploaded.name != st.session_state.ppt_name or payload != st.session_state.ppt_payload:
+                    reset_presentation_editing_state()
+                records = read_pptx(payload)
+                for record in records:
+                    record["narration"] = apply_dictionary(build_narration(record, style), st.session_state.dictionary)
+                    record["skip"] = False
+                    record["pause_after"] = 0.35
+                st.session_state.records = records
+                st.session_state.ppt_name = uploaded.name
+                st.session_state.ppt_payload = payload
+                st.session_state.original_slide_images = []
+                st.session_state.render_warning = ""
+                try:
+                    rendered, backend = render_pptx_slides(payload, uploaded.name)
+                    if len(rendered) != len(records):
+                        raise PowerPointRenderError(
+                            f"Số ảnh render ({len(rendered)}) khác số slide ({len(records)})."
+                        )
+                    st.session_state.original_slide_images = rendered
+                    st.session_state.render_backend = backend
+                except Exception as render_exc:
+                    st.session_state.render_backend = "Dựng lại từ text"
+                    st.session_state.render_warning = str(render_exc)
+                st.success(f"Đã phân tích {len(records)} slide từ {uploaded.name}.")
+            except Exception as exc:
+                st.error(f"Không đọc được PowerPoint: {exc}")
 
     if st.session_state.records:
         c1, c2, c3, c4 = st.columns(4)
@@ -166,50 +355,149 @@ with tab_story:
     records = st.session_state.records
     if not records:
         st.warning("Hãy tải PowerPoint ở bước 1.")
+        st.download_button(
+            "Tải mẫu Storyboard CSV",
+            storyboard_csv_bytes(),
+            "storyboard_mau.csv",
+            "text/csv",
+            help="Sau khi tải PowerPoint, dùng chính file mẫu theo số slide của bài trình bày để nhập lại.",
+        )
     else:
+        ensure_boundary_defaults(records)
         st.subheader("Cấu hình slide mở đầu")
         intro_mode_label = st.radio("Nguồn mở đầu", ["Không thêm", "Chọn slide trong PowerPoint", "Slide mặc định", "Tải ảnh riêng"], horizontal=True, key="intro_mode_label")
         intro_mode = {"Không thêm":"none", "Chọn slide trong PowerPoint":"source_slide", "Slide mặc định":"system_default", "Tải ảnh riêng":"uploaded_image"}[intro_mode_label]
         intro_index = None
-        intro_title = st.session_state.records[0]["title"]
-        intro_subtitle = st.session_state.organization
+        intro_title = st.session_state.intro_title
+        intro_subtitle = st.session_state.intro_subtitle
         remove_intro = True
         if intro_mode == "source_slide":
-            intro_index = st.selectbox("Chọn slide mở đầu", [r["slide"] for r in records], format_func=lambda n: f"Slide {n} — {records[n-1]['title']}")
+            intro_index = st.selectbox("Chọn slide mở đầu", [r["slide"] for r in records], format_func=lambda n: f"Slide {n} — {records[n-1]['title']}", key="intro_source_slide")
             remove_intro = st.checkbox("Không lặp lại slide này ở vị trí cũ", value=True, key="remove_intro")
         elif intro_mode == "system_default":
-            intro_title = st.text_input("Tiêu đề mở đầu", value=intro_title, key="intro_title")
-            intro_subtitle = st.text_input("Phụ đề mở đầu", value=intro_subtitle, key="intro_subtitle")
+            intro_title = st.text_input("Tiêu đề mở đầu", key="intro_title")
+            intro_subtitle = st.text_input("Phụ đề mở đầu", key="intro_subtitle")
         elif intro_mode == "uploaded_image":
             intro_file = st.file_uploader("Ảnh mở đầu", type=["png", "jpg", "jpeg"], key="intro_image")
             if intro_file:
                 st.session_state.intro_upload = intro_file.getvalue()
+            if st.session_state.intro_upload:
+                st.image(st.session_state.intro_upload, caption="Ảnh mở đầu", width=260)
+        if intro_mode != "none":
+            intro_narration = st.text_area(
+                "Lời thuyết minh mở đầu",
+                key="intro_narration",
+                height=96,
+                help="Dùng cho cả slide PowerPoint, slide mặc định và ảnh riêng.",
+            )
+        else:
+            intro_narration = st.session_state.intro_narration
 
         st.subheader("Cấu hình slide kết thúc")
         outro_mode_label = st.radio("Nguồn kết thúc", ["Không thêm", "Chọn slide trong PowerPoint", "Slide mặc định", "Tải ảnh riêng"], horizontal=True, key="outro_mode_label")
         outro_mode = {"Không thêm":"none", "Chọn slide trong PowerPoint":"source_slide", "Slide mặc định":"system_default", "Tải ảnh riêng":"uploaded_image"}[outro_mode_label]
         outro_index = None
-        outro_title = "Trân trọng cảm ơn"
-        outro_subtitle = st.session_state.organization
+        outro_title = st.session_state.outro_title
+        outro_subtitle = st.session_state.outro_subtitle
         remove_outro = True
         if outro_mode == "source_slide":
-            outro_index = st.selectbox("Chọn slide kết thúc", [r["slide"] for r in records], index=len(records)-1, format_func=lambda n: f"Slide {n} — {records[n-1]['title']}")
+            outro_index = st.selectbox("Chọn slide kết thúc", [r["slide"] for r in records], index=len(records)-1, format_func=lambda n: f"Slide {n} — {records[n-1]['title']}", key="outro_source_slide")
             remove_outro = st.checkbox("Không lặp lại slide này ở vị trí cũ", value=True, key="remove_outro")
         elif outro_mode == "system_default":
-            outro_title = st.text_input("Tiêu đề kết thúc", value=outro_title, key="outro_title")
-            outro_subtitle = st.text_input("Phụ đề kết thúc", value=outro_subtitle, key="outro_subtitle")
+            outro_title = st.text_input("Tiêu đề kết thúc", key="outro_title")
+            outro_subtitle = st.text_input("Phụ đề kết thúc", key="outro_subtitle")
         elif outro_mode == "uploaded_image":
             outro_file = st.file_uploader("Ảnh kết thúc", type=["png", "jpg", "jpeg"], key="outro_image")
             if outro_file:
                 st.session_state.outro_upload = outro_file.getvalue()
+            if st.session_state.outro_upload:
+                st.image(st.session_state.outro_upload, caption="Ảnh kết thúc", width=260)
+        if outro_mode != "none":
+            outro_narration = st.text_area(
+                "Lời thuyết minh kết thúc",
+                key="outro_narration",
+                height=96,
+                help="Dùng cho cả slide PowerPoint, slide mặc định và ảnh riêng.",
+            )
+        else:
+            outro_narration = st.session_state.outro_narration
 
         st.session_state.boundary = {
-            "intro": asdict(BoundarySlideConfig(intro_mode, intro_index, remove_intro, intro_title, intro_subtitle, f"Xin chào quý anh chị. Nội dung trình bày hôm nay là {intro_title}.")),
-            "outro": asdict(BoundarySlideConfig(outro_mode, outro_index, remove_outro, outro_title, outro_subtitle, "Nội dung trình bày xin được kết thúc tại đây. Trân trọng cảm ơn quý anh chị đã theo dõi.")),
+            "intro": asdict(BoundarySlideConfig(
+                mode=intro_mode,
+                source_slide_number=intro_index,
+                remove_from_original_position=remove_intro,
+                title=intro_title,
+                subtitle=intro_subtitle,
+                narration=intro_narration,
+            )),
+            "outro": asdict(BoundarySlideConfig(
+                mode=outro_mode,
+                source_slide_number=outro_index,
+                remove_from_original_position=remove_outro,
+                title=outro_title,
+                subtitle=outro_subtitle,
+                narration=outro_narration,
+            )),
         }
 
         st.divider()
         st.subheader("Biên tập storyboard")
+        st.caption("Tải file mẫu, điền lại các cột cần sửa rồi nhập CSV, Excel hoặc project JSON đã xuất trước đó.")
+        template_col, import_col = st.columns(2)
+        with template_col:
+            st.download_button(
+                "Tải mẫu Storyboard CSV",
+                storyboard_csv_bytes(records),
+                "storyboard_mau.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+        with import_col:
+            try:
+                st.download_button(
+                    "Tải mẫu Storyboard Excel",
+                    storyboard_xlsx_bytes(records),
+                    "storyboard_mau.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except ImportError:
+                st.caption("Cài `openpyxl` để dùng file mẫu Excel.")
+
+        storyboard_file = st.file_uploader(
+            "Nhập dữ liệu Storyboard",
+            type=["csv", "tsv", "xlsx", "xls", "json"],
+            key="storyboard_import_file",
+            help="Khớp theo cột Slide. Có thể nhập Tiêu đề, Lời thuyết minh, Xuất và Nghỉ sau (giây).",
+        )
+        storyboard_import_notice = st.session_state.pop("storyboard_import_notice", None)
+        if storyboard_import_notice:
+            st.success(storyboard_import_notice)
+        if storyboard_file:
+            try:
+                imported_storyboard = read_storyboard_upload(
+                    storyboard_file.getvalue(), storyboard_file.name
+                )
+                st.caption(f"Đã đọc {len(imported_storyboard)} dòng từ {storyboard_file.name}. Kiểm tra trước khi áp dụng.")
+                st.dataframe(imported_storyboard.head(20), use_container_width=True, hide_index=True)
+                if st.button("Kiểm tra và áp dụng dữ liệu import", key="apply_storyboard_import", use_container_width=True):
+                    updates = prepare_storyboard_updates(records, imported_storyboard)
+                    blocked = [
+                        f"Slide {update.slide}"
+                        for update in updates
+                        if update.narration is not None and profanity.contains_profanity(update.narration)
+                    ]
+                    if blocked:
+                        st.error("Không thể nhập lời thuyết minh chứa từ ngữ không phù hợp: " + ", ".join(blocked))
+                    else:
+                        changed = apply_storyboard_updates(records, updates)
+                        st.session_state.pop("storyboard_editor", None)
+                        st.session_state.storyboard_import_notice = f"Đã áp dụng dữ liệu import cho {changed}/{len(updates)} slide."
+                        st.rerun()
+            except Exception as exc:
+                st.error(f"Không thể nhập Storyboard: {exc}")
+
         edited = st.data_editor(
             pd.DataFrame([{
                 "Xuất": not r.get("skip", False), "Slide": r["slide"], "Loại": r["slide_type"],
@@ -229,7 +517,10 @@ with tab_story:
                 st.error(f"Lời thuyết minh slide {records[i]['slide']} chứa từ ngữ không phù hợp.")
             else:
                 records[i]["narration"] = narration
-            records[i]["pause_after"] = float(row["Nghỉ sau (giây)"])
+            try:
+                records[i]["pause_after"] = float(row["Nghỉ sau (giây)"])
+            except (TypeError, ValueError):
+                st.error(f"Khoảng nghỉ sau slide {records[i]['slide']} phải là một số.")
 
 with tab_dict:
     st.subheader("Từ điển phát âm")
@@ -288,12 +579,120 @@ with tab_export:
     if not records:
         st.warning("Hãy tải và biên tập PowerPoint trước khi xuất.")
     else:
-        c1, c2, c3 = st.columns(3)
-        voice_id = c1.selectbox("Giọng đọc", ["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"])
-        voice_rate = c2.selectbox("Tốc độ", ["-10%", "-5%", "+0%", "+5%", "+10%"], index=2)
-        fps = c3.selectbox("FPS", [12, 15, 24], index=1)
-        burn_subtitles = st.checkbox("Đốt phụ đề vào video", value=True)
-        subtitle_position = st.selectbox("Vị trí phụ đề", ["Dưới", "Giữa"])
+        st.subheader("Giọng đọc")
+        voice_source = st.radio(
+            "Nguồn giọng đọc",
+            ["AI tiếng Việt", "Bản thu thật theo từng slide", "Nhân bản giọng từ mẫu (API riêng)"],
+            horizontal=True,
+            key="voice_source",
+        )
+        voice_engine = "edge"
+        voice_id = "vi-VN-HoaiMyNeural"
+        voice_rate = "+0%"
+        voice_clone_config = None
+        voice_clone_consent = False
+        recorded_voice_assets: dict[int | str, AudioAsset] = {}
+        voice_upload_unlocked = voice_source == "AI tiếng Việt"
+
+        if not voice_upload_unlocked:
+            voice_upload_unlocked = unlock_voice_uploads()
+
+        if voice_source == "AI tiếng Việt":
+            voice_col, rate_col = st.columns(2)
+            voice_id = voice_col.selectbox(
+                "Giọng AI",
+                ["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"],
+            )
+            voice_rate = rate_col.selectbox(
+                "Tốc độ",
+                ["-10%", "-5%", "+0%", "+5%", "+10%"],
+                index=2,
+            )
+            st.caption("Dùng Edge TTS; audio được tạo riêng cho từng slide để khớp phụ đề và avatar.")
+        elif voice_source == "Bản thu thật theo từng slide":
+            voice_engine = "uploaded"
+            if voice_upload_unlocked:
+                audio_files = st.file_uploader(
+                    "Tải các bản thu lời đọc",
+                    type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
+                    accept_multiple_files=True,
+                    key="recorded_voice_files",
+                    help="Đặt tên slide_001.mp3, slide_002.wav…; dùng intro.mp3 hoặc outro.mp3 cho ảnh/slide mở đầu và kết thúc.",
+                )
+                recorded_voice_assets, audio_file_errors = uploaded_audio_assets(audio_files or [])
+                for error in audio_file_errors:
+                    st.error(error)
+                if recorded_voice_assets:
+                    slots = [f"slide {slot}" if isinstance(slot, int) else str(slot) for slot in recorded_voice_assets]
+                    st.success("Đã nhận bản thu cho: " + ", ".join(slots))
+                st.info(
+                    "Chế độ này dùng nguyên giọng thật trong các file bạn tải lên; không gửi giọng đi để nhân bản. "
+                    "Cần có file cho mọi slide/cảnh có lời thuyết minh được xuất."
+                )
+            else:
+                st.info("Nhập đúng mật khẩu ở trên để tải các bản thu lời đọc.")
+        else:
+            voice_engine = "voice_clone"
+            if voice_upload_unlocked:
+                clone_sample = st.file_uploader(
+                    "Tải mẫu giọng (khuyến nghị 15–60 giây, rõ tiếng, một người nói)",
+                    type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
+                    key="voice_clone_reference",
+                )
+                clone_col, model_col = st.columns([2, 1])
+                clone_endpoint = clone_col.text_input(
+                    "Voice-clone API endpoint",
+                    value=os.getenv("VOICE_CLONE_API_URL", ""),
+                    placeholder="https://your-voice-service.example.com/v1/voice-clone/synthesize",
+                    help="Endpoint nhận mẫu giọng và text rồi trả audio. Xem README để biết hợp đồng API.",
+                    key="voice_clone_endpoint",
+                )
+                clone_model = model_col.text_input(
+                    "Model",
+                    value=os.getenv("VOICE_CLONE_MODEL", "default"),
+                    help="Tên model mà API riêng của bạn yêu cầu.",
+                    key="voice_clone_model",
+                )
+                clone_api_key = st.text_input(
+                    "API key (nếu có)",
+                    value=os.getenv("VOICE_CLONE_API_KEY", ""),
+                    type="password",
+                    key="voice_clone_api_key",
+                )
+                clone_transcript = st.text_area(
+                    "Nội dung của mẫu giọng (không bắt buộc)",
+                    height=74,
+                    help="Một số model clone giọng dùng transcript này để tăng độ chính xác.",
+                    key="voice_clone_transcript",
+                )
+                clone_verify_ssl = st.checkbox("Xác minh SSL", value=True, key="voice_clone_verify_ssl")
+                voice_clone_consent = st.checkbox(
+                    "Tôi xác nhận mình sở hữu giọng này hoặc có sự đồng ý rõ ràng của người sở hữu giọng.",
+                    key="voice_clone_consent",
+                )
+                if clone_sample:
+                    st.audio(clone_sample.getvalue(), format=clone_sample.type or "audio/mpeg")
+                if clone_sample and voice_clone_consent:
+                    voice_clone_config = VoiceCloneConfig(
+                        endpoint=clone_endpoint,
+                        reference_audio=clone_sample.getvalue(),
+                        reference_filename=clone_sample.name,
+                        model=clone_model,
+                        api_key=clone_api_key,
+                        reference_transcript=clone_transcript,
+                        verify_ssl=clone_verify_ssl,
+                    )
+                st.info(
+                    "Mẫu giọng chỉ được giữ trong phiên xuất và gửi tới endpoint bạn cấu hình khi tạo video; "
+                    "không được đưa vào file project tải xuống. Chỉ dùng giọng có quyền sử dụng."
+                )
+            else:
+                st.info("Nhập đúng mật khẩu ở trên để tải mẫu giọng và cấu hình nhân bản giọng.")
+
+        render_col, subtitle_col, fps_col = st.columns(3)
+        burn_subtitles = render_col.checkbox("Đốt phụ đề vào video", value=True)
+        subtitle_position = subtitle_col.selectbox("Vị trí phụ đề", ["Dưới", "Giữa"])
+        fps = fps_col.selectbox("FPS", [12, 15, 24], index=1)
         subtitle_font_size = st.slider("Cỡ chữ phụ đề", 20, 40, 28)
 
         st.divider()
@@ -442,11 +841,21 @@ with tab_export:
                                     result_path = preview_dir / "preview.mp4"
                                     avatar_image.convert("RGB").save(image_path)
                                     preview_text = apply_dictionary(preview_record["narration"], st.session_state.dictionary)[:380]
-                                    synthesize_edge_tts_audio(
-                                        [VideoScene(title="Preview", narration=preview_text)],
-                                        audio_path, voice=voice_id, rate=voice_rate,
+                                    preview_scene = VideoScene(
+                                        title="Preview",
+                                        narration=preview_text,
+                                        source_slide_number=preview_record["slide"],
                                     )
-                                    if not audio_path.exists():
+                                    audio_path = synthesize_scene_audio(
+                                        preview_scene,
+                                        audio_path,
+                                        voice_engine=voice_engine,
+                                        voice_id=voice_id,
+                                        voice_rate=voice_rate,
+                                        voice_clone_config=voice_clone_config,
+                                        uploaded_audio=audio_asset_for_scene(preview_scene, recorded_voice_assets),
+                                    )
+                                    if audio_path is None or not audio_path.exists():
                                         raise RuntimeError("Không tạo được audio preview.")
                                     generate_talking_head(
                                         ai_avatar_config, image_path, audio_path, result_path, preview_seconds=5.0
@@ -465,20 +874,36 @@ with tab_export:
                 st.warning("Hãy tải ảnh người dẫn để dùng OpenAvatar Runtime.")
             else:
                 if st.button("Chuẩn bị audio cho OpenAvatar Runtime", use_container_width=True):
-                    st.session_state.local_avatar_audio = {}
-                    st.session_state.local_avatar_clips = {}
-                    st.session_state.local_avatar_queue = []
-                    prep_dir = Path(tempfile.mkdtemp(prefix="local_avatar_audio_"))
-                    for rec in records:
-                        if rec.get("skip") or not rec.get("narration", "").strip():
-                            continue
-                        audio_path = prep_dir / f"slide_{rec['slide']:03}.mp3"
-                        text_value = apply_dictionary(rec["narration"], st.session_state.dictionary)
-                        synthesize_edge_tts_audio([VideoScene(title=rec["title"], narration=text_value)], audio_path, voice=voice_id, rate=voice_rate)
-                        if audio_path.exists():
-                            st.session_state.local_avatar_audio[rec["slide"]] = audio_path.read_bytes()
-                            st.session_state.local_avatar_queue.append(rec["slide"])
-                    st.rerun()
+                    try:
+                        st.session_state.local_avatar_audio = {}
+                        st.session_state.local_avatar_clips = {}
+                        st.session_state.local_avatar_queue = []
+                        prep_dir = Path(tempfile.mkdtemp(prefix="local_avatar_audio_"))
+                        for rec in records:
+                            if rec.get("skip") or not rec.get("narration", "").strip():
+                                continue
+                            audio_path = prep_dir / f"slide_{rec['slide']:03}.mp3"
+                            text_value = apply_dictionary(rec["narration"], st.session_state.dictionary)
+                            source_scene = VideoScene(
+                                title=rec["title"],
+                                narration=text_value,
+                                source_slide_number=rec["slide"],
+                            )
+                            prepared_audio = synthesize_scene_audio(
+                                source_scene,
+                                audio_path,
+                                voice_engine=voice_engine,
+                                voice_id=voice_id,
+                                voice_rate=voice_rate,
+                                voice_clone_config=voice_clone_config,
+                                uploaded_audio=audio_asset_for_scene(source_scene, recorded_voice_assets),
+                            )
+                            if prepared_audio and prepared_audio.exists():
+                                st.session_state.local_avatar_audio[rec["slide"]] = prepared_audio.read_bytes()
+                                st.session_state.local_avatar_queue.append(rec["slide"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Không chuẩn bị được audio cho OpenAvatar Runtime: {exc}")
 
                 queue = st.session_state.local_avatar_queue
                 if queue:
@@ -505,6 +930,16 @@ with tab_export:
                     st.success(f"Đã tạo {done}/{total} clip avatar bằng OpenAvatar Runtime.")
 
         if st.button("Tạo video", type="primary", use_container_width=True):
+            if voice_engine in {"uploaded", "voice_clone"} and not voice_upload_unlocked:
+                st.error("Cần nhập mật khẩu để dùng giọng tải lên.")
+                st.stop()
+            if voice_engine == "voice_clone":
+                if not voice_clone_consent:
+                    st.error("Cần xác nhận quyền sử dụng giọng trước khi nhân bản giọng.")
+                    st.stop()
+                if voice_clone_config is None or not voice_clone_config.endpoint.strip():
+                    st.error("Cần tải mẫu giọng và nhập Voice-clone API endpoint trước khi tạo video.")
+                    st.stop()
             if presenter_mode == "AI nhép môi qua GPU API" and (ai_avatar_config is None or avatar_image is None):
                 st.error("Chế độ AI nhép môi cần ảnh người dẫn và GPU API URL.")
                 st.stop()
@@ -534,15 +969,33 @@ with tab_export:
                         return
                     if mode == "source_slide":
                         rec = records[int(cfg["source_slide_number"]) - 1]
-                        scenes.append(VideoScene(title=rec["title"], bullets=tuple(rec["bullets"]), narration=rec["narration"], slide_type=side, source_slide_number=rec["slide"]))
+                        scenes.append(VideoScene(
+                            title=rec["title"],
+                            bullets=tuple(rec["bullets"]),
+                            narration=apply_dictionary(
+                                cfg.get("narration") or rec["narration"],
+                                st.session_state.dictionary,
+                            ),
+                            slide_type=side,
+                            source_slide_number=rec["slide"],
+                        ))
                         images.append(st.session_state.original_slide_images[rec["slide"] - 1].copy() if st.session_state.original_slide_images else build_content_slide(rec["title"], rec["bullets"], st.session_state.organization, side))
                     elif mode == "uploaded_image":
                         payload = st.session_state.intro_upload if side == "intro" else st.session_state.outro_upload
                         if payload:
-                            scenes.append(VideoScene(title=side.title(), narration=cfg.get("narration", ""), slide_type=side))
+                            scenes.append(VideoScene(
+                                title=side.title(),
+                                narration=apply_dictionary(cfg.get("narration", ""), st.session_state.dictionary),
+                                slide_type=side,
+                            ))
                             images.append(Image.open(io.BytesIO(payload)).convert("RGB"))
                     else:
-                        scenes.append(VideoScene(title=cfg.get("title", ""), subtitle=cfg.get("subtitle", ""), narration=cfg.get("narration", ""), slide_type=side))
+                        scenes.append(VideoScene(
+                            title=cfg.get("title", ""),
+                            subtitle=cfg.get("subtitle", ""),
+                            narration=apply_dictionary(cfg.get("narration", ""), st.session_state.dictionary),
+                            slide_type=side,
+                        ))
                         images.append(build_boundary_slide(cfg.get("title", ""), cfg.get("subtitle", ""), st.session_state.organization, side))
 
                 add_boundary("intro")
@@ -553,6 +1006,45 @@ with tab_export:
                     images.append(st.session_state.original_slide_images[rec["slide"] - 1].copy() if st.session_state.original_slide_images else build_content_slide(rec["title"], rec["bullets"], st.session_state.organization))
                 add_boundary("outro")
 
+                missing_boundary_images = [
+                    side
+                    for side in ("intro", "outro")
+                    if boundary[side].get("mode") == "uploaded_image"
+                    and not (st.session_state.intro_upload if side == "intro" else st.session_state.outro_upload)
+                ]
+                if missing_boundary_images:
+                    st.error("Chưa tải ảnh cho slide " + " và ".join(missing_boundary_images) + ".")
+                    st.stop()
+
+                scene_audio_assets = [
+                    audio_asset_for_scene(scene, recorded_voice_assets) for scene in scenes
+                ]
+                if voice_engine == "uploaded":
+                    missing_audio = [
+                        scene_label(scene)
+                        for scene, audio_asset in zip(scenes, scene_audio_assets)
+                        if scene.narration.strip() and audio_asset is None
+                    ]
+                    if missing_audio:
+                        st.error(
+                            "Thiếu bản thu thật cho: "
+                            + ", ".join(missing_audio[:12])
+                            + ". Đặt tên file theo slide_001.mp3 hoặc intro.mp3/outro.mp3."
+                        )
+                        st.stop()
+
+                invalid_scene_narrations = [
+                    scene_label(scene)
+                    for scene in scenes
+                    if profanity.contains_profanity(scene.narration)
+                ]
+                if invalid_scene_narrations:
+                    st.error(
+                        "Không thể render. Lời thuyết minh chứa nội dung không phù hợp tại: "
+                        + ", ".join(invalid_scene_narrations[:12])
+                    )
+                    st.stop()
+
                 try:
                     with st.spinner("Đang tạo audio từng slide và ghép video..."):
                         temp_dir = Path(tempfile.mkdtemp(prefix="ppt_video_studio_"))
@@ -562,8 +1054,11 @@ with tab_export:
                         if presenter_mode == "AI nhép môi bằng OpenAvatar Runtime":
                             local_avatar_videos_for_export = [st.session_state.local_avatar_clips.get(scene.source_slide_number) for scene in scenes]
                         output, _, srt_text = export_storyboard_video(
-                            scenes, video_path, fps=fps, with_voice=True, voice_id=voice_id,
-                            voice_rate=voice_rate, slide_images=images, burn_subtitles=burn_subtitles,
+                            scenes, video_path, fps=fps, with_voice=True,
+                            voice_engine=voice_engine, voice_id=voice_id,
+                            voice_rate=voice_rate, voice_clone_config=voice_clone_config,
+                            scene_audio_assets=scene_audio_assets,
+                            slide_images=images, burn_subtitles=burn_subtitles,
                             subtitle_position=subtitle_position, subtitle_font_size=subtitle_font_size,
                             srt_path=srt_path, avatar_image=avatar_image,
                             avatar_position=avatar_position, avatar_size_percent=avatar_size_percent,
@@ -576,6 +1071,13 @@ with tab_export:
                             "project_version": 1,
                             "source_file_name": st.session_state.ppt_name,
                             "organization": st.session_state.organization,
+                            "voice": {
+                                "source": voice_engine,
+                                "voice_id": voice_id if voice_engine == "edge" else None,
+                                "voice_rate": voice_rate if voice_engine == "edge" else None,
+                                "voice_clone_model": voice_clone_config.model if voice_clone_config else None,
+                                "has_recorded_audio": bool(recorded_voice_assets),
+                            },
                             "boundary": boundary,
                             "dictionary": json.loads(dictionary_json(st.session_state.dictionary)),
                             "storyboard": records,
@@ -585,7 +1087,11 @@ with tab_export:
                         d1, d2, d3, d4 = st.columns(4)
                         d1.download_button("Tải MP4", output.read_bytes(), "ppt_video.mp4", "video/mp4")
                         d2.download_button("Tải SRT", srt_text.encode("utf-8"), "ppt_video.srt", "text/plain")
-                        script_text = "\n\n".join(f"Slide {r['slide']}: {r['narration']}" for r in records if not r.get("skip"))
+                        script_text = "\n\n".join(
+                            f"{scene_label(scene).capitalize()}: {scene.narration}"
+                            for scene in scenes
+                            if scene.narration.strip()
+                        )
                         d3.download_button("Tải script", script_text.encode("utf-8"), "narration.txt", "text/plain")
                         d4.download_button("Tải project", json.dumps(project, ensure_ascii=False, indent=2).encode("utf-8"), "ppt_video_project.json", "application/json")
                 except Exception as exc:

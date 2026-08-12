@@ -16,7 +16,9 @@ import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from .audio_assets import AudioAsset, write_audio_asset
 from .avatar_api import AvatarApiConfig, generate_talking_head
+from .voice_clone import VoiceCloneConfig, synthesize_voice_clone_audio
 
 
 @dataclass(frozen=True)
@@ -285,6 +287,44 @@ def synthesize_narration_wav(
     engine.save_to_file(text, str(output_path))
     engine.runAndWait()
     return output_path if output_path.exists() and output_path.stat().st_size > 0 else None
+
+
+def synthesize_scene_audio(
+    scene: VideoScene,
+    output_path: str | Path,
+    *,
+    voice_engine: str = "edge",
+    voice_id: str = "vi-VN-HoaiMyNeural",
+    voice_rate: str = "+0%",
+    voice_clone_config: VoiceCloneConfig | None = None,
+    uploaded_audio: AudioAsset | None = None,
+) -> Path | None:
+    """Chuẩn bị audio cho một cảnh từ TTS, clone giọng hoặc bản thu thật."""
+
+    output_path = Path(output_path)
+    if voice_engine == "uploaded":
+        if uploaded_audio is None:
+            if scene.narration.strip():
+                label = scene.source_slide_number or scene.slide_number or scene.slide_type
+                raise ValueError(f"Thiếu bản thu lời đọc cho cảnh {label}.")
+            return None
+        target = write_audio_asset(uploaded_audio, output_path)
+        return target if target is not None and target.exists() and target.stat().st_size > 0 else None
+
+    text = scene.narration or f"{scene.title}. {scene.subtitle}"
+    if not text.strip():
+        return None
+    if voice_engine == "voice_clone":
+        if voice_clone_config is None:
+            raise ValueError("Chưa cấu hình dịch vụ nhân bản giọng.")
+        return synthesize_voice_clone_audio(text, output_path, config=voice_clone_config)
+    if voice_engine == "edge":
+        return synthesize_edge_tts_audio(
+            [scene], output_path, voice=voice_id, rate=voice_rate
+        )
+    return synthesize_narration_wav(
+        [scene], output_path.with_suffix(".wav"), voice_hint=voice_id or "Vietnam"
+    )
 
 
 def export_video(
@@ -591,6 +631,8 @@ def export_storyboard_video(
     voice_engine: str = "edge",
     voice_id: str = "vi-VN-HoaiMyNeural",
     voice_rate: str = "+0%",
+    voice_clone_config: VoiceCloneConfig | None = None,
+    scene_audio_assets: Sequence[AudioAsset | None] | None = None,
     slide_images: Sequence[Image.Image] | None = None,
     burn_subtitles: bool = True,
     subtitle_position: str = "Dưới",
@@ -610,6 +652,9 @@ def export_storyboard_video(
     active_scenes = [scene for scene in scenes if not scene.skip]
     if not active_scenes:
         raise ValueError("Không có slide nào được chọn để xuất video.")
+
+    if scene_audio_assets is not None and len(scene_audio_assets) != len(scenes):
+        raise ValueError("Số bản thu lời đọc phải bằng số cảnh trong storyboard.")
 
     if slide_images:
         active_images = [image for scene, image in zip(scenes, slide_images) if not scene.skip]
@@ -631,21 +676,19 @@ def export_storyboard_video(
         durations: list[float] = []
 
         active_local_videos = [video for scene, video in zip(scenes, local_avatar_videos or [None] * len(scenes)) if not scene.skip] if local_avatar_videos is not None else [None] * len(active_scenes)
+        active_audio_assets = [asset for scene, asset in zip(scenes, scene_audio_assets or [None] * len(scenes)) if not scene.skip] if scene_audio_assets is not None else [None] * len(active_scenes)
 
-        for index, (scene, image, local_video_bytes) in enumerate(zip(active_scenes, active_images, active_local_videos), start=1):
+        for index, (scene, image, local_video_bytes, uploaded_audio) in enumerate(zip(active_scenes, active_images, active_local_videos, active_audio_assets), start=1):
             audio_path: Path | None = None
-            if with_voice and scene.narration.strip() and voice_engine == "edge":
-                audio_path = synthesize_edge_tts_audio(
-                    [scene],
+            if with_voice:
+                audio_path = synthesize_scene_audio(
+                    scene,
                     tmp_dir / f"slide_{index:03}.mp3",
-                    voice=voice_id,
-                    rate=voice_rate,
-                )
-            elif with_voice and scene.narration.strip():
-                audio_path = synthesize_narration_wav(
-                    [scene],
-                    tmp_dir / f"slide_{index:03}.wav",
-                    voice_hint=voice_id or "Vietnam",
+                    voice_engine=voice_engine,
+                    voice_id=voice_id,
+                    voice_rate=voice_rate,
+                    voice_clone_config=voice_clone_config,
+                    uploaded_audio=uploaded_audio,
                 )
 
             audio_duration = _media_duration(audio_path) if audio_path else None

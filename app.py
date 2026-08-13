@@ -642,15 +642,15 @@ with tab_export:
                 clone_col, model_col = st.columns([2, 1])
                 clone_endpoint = clone_col.text_input(
                     "Voice-clone API endpoint",
-                    value=os.getenv("VOICE_CLONE_API_URL", ""),
-                    placeholder="https://your-voice-service.example.com/v1/voice-clone/synthesize",
-                    help="Endpoint nhận mẫu giọng và text rồi trả audio. Xem README để biết hợp đồng API.",
+                    value=os.getenv("VOICE_CLONE_API_URL", "http://127.0.0.1:8009/v1/voice-clone/synthesize"),
+                    placeholder="http://127.0.0.1:8009/v1/voice-clone/synthesize",
+                    help="Mặc định là Local Voice Clone Service trên máy này. Endpoint nhận mẫu giọng và text rồi trả audio.",
                     key="voice_clone_endpoint",
                 )
                 clone_model = model_col.text_input(
                     "Model",
-                    value=os.getenv("VOICE_CLONE_MODEL", "default"),
-                    help="Tên model mà API riêng của bạn yêu cầu.",
+                    value=os.getenv("VOICE_CLONE_MODEL", "f5-tts"),
+                    help="Dùng f5-tts cho Local Voice Clone Service.",
                     key="voice_clone_model",
                 )
                 clone_api_key = st.text_input(
@@ -680,11 +680,13 @@ with tab_export:
                         model=clone_model,
                         api_key=clone_api_key,
                         reference_transcript=clone_transcript,
+                        voice_use_consent=voice_clone_consent,
+                        upload_password=str(st.session_state.get("voice_upload_password", "")),
                         verify_ssl=clone_verify_ssl,
                     )
                 st.info(
-                    "Mẫu giọng chỉ được giữ trong phiên xuất và gửi tới endpoint bạn cấu hình khi tạo video; "
-                    "không được đưa vào file project tải xuống. Chỉ dùng giọng có quyền sử dụng."
+                    "Local Voice Clone Service mặc định chạy tại 127.0.0.1:8009: audio và text không rời máy. "
+                    "Mẫu giọng chỉ được giữ trong phiên xuất và không được đưa vào file project tải xuống."
                 )
             else:
                 st.info("Nhập đúng mật khẩu ở trên để tải mẫu giọng và cấu hình nhân bản giọng.")

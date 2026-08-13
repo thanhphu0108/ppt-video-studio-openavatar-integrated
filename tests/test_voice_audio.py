@@ -1,7 +1,13 @@
 from unittest.mock import Mock, patch
 
 from src.audio_assets import AudioAsset, write_audio_asset
-from src.voice_clone import VoiceCloneConfig, _response_audio, synthesize_voice_clone_audio
+from src.video_export import VideoScene, synthesize_scene_audio
+from src.voice_clone import (
+    VoiceCloneConfig,
+    _response_audio,
+    is_loopback_voice_clone_endpoint,
+    synthesize_voice_clone_audio,
+)
 
 
 def test_uploaded_scene_audio_is_written_with_original_extension(tmp_path):
@@ -43,3 +49,25 @@ def test_voice_clone_accepts_base64_data_url():
     response.json.return_value = {"audio_base64": "data:audio/mpeg;base64,YXVkaW8="}
 
     assert _response_audio(response, timeout_seconds=1, verify_ssl=True) == b"audio"
+
+
+def test_loopback_detection_only_accepts_local_voice_service():
+    assert is_loopback_voice_clone_endpoint("http://127.0.0.1:8009/v1/voice-clone/synthesize")
+    assert not is_loopback_voice_clone_endpoint("https://voice.example.test/synthesize")
+
+
+def test_local_voice_clone_requests_wav_source_for_lipsync(tmp_path):
+    config = VoiceCloneConfig(
+        endpoint="http://127.0.0.1:8009/v1/voice-clone/synthesize",
+        reference_audio=b"reference-audio",
+        reference_filename="my_voice.wav",
+    )
+    with patch("src.video_export.synthesize_voice_clone_audio", return_value=tmp_path / "voice.wav") as synthesize:
+        result = synthesize_scene_audio(
+            VideoScene(title="Slide 1", narration="Kính thưa quý anh chị."),
+            tmp_path / "voice.mp3",
+            voice_engine="voice_clone",
+            voice_clone_config=config,
+        )
+    assert result.suffix == ".wav"
+    assert synthesize.call_args.args[1].suffix == ".wav"

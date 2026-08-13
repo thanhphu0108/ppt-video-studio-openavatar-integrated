@@ -18,7 +18,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .audio_assets import AudioAsset, write_audio_asset
 from .avatar_api import AvatarApiConfig, generate_talking_head
-from .voice_clone import VoiceCloneConfig, synthesize_voice_clone_audio
+from .voice_clone import (
+    VoiceCloneConfig,
+    is_loopback_voice_clone_endpoint,
+    synthesize_voice_clone_audio,
+)
 
 
 @dataclass(frozen=True)
@@ -317,6 +321,10 @@ def synthesize_scene_audio(
     if voice_engine == "voice_clone":
         if voice_clone_config is None:
             raise ValueError("Chưa cấu hình dịch vụ nhân bản giọng.")
+        # Keep the local clone's source in WAV for OpenAvatar/Wav2Lip. Remote
+        # clone providers preserve the requested suffix for compatibility.
+        if is_loopback_voice_clone_endpoint(voice_clone_config.endpoint):
+            output_path = output_path.with_suffix(".wav")
         return synthesize_voice_clone_audio(text, output_path, config=voice_clone_config)
     if voice_engine == "edge":
         return synthesize_edge_tts_audio(

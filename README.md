@@ -14,7 +14,7 @@
 - Import/export từ điển.
 - Kiểm duyệt từ ngữ không phù hợp khi thêm, import và render.
 - Chọn slide PowerPoint, slide hệ thống hoặc ảnh tải lên làm intro/outro, mỗi loại đều có lời thuyết minh riêng.
-- Ba nguồn giọng: Edge TTS, bản thu thật theo từng slide và nhân bản giọng qua API riêng có xác nhận quyền sử dụng giọng.
+- Ba nguồn giọng: Edge TTS, bản thu thật theo từng slide và nhân bản giọng local F5-TTS qua API riêng có xác nhận quyền sử dụng giọng.
 - Các luồng tải audio giọng được bảo vệ bằng mật khẩu theo phiên sử dụng.
 - Phụ đề đốt vào video và file SRT.
 - Fade, zoom nhẹ và hiệu ứng người dẫn.
@@ -23,7 +23,7 @@
 - AI nhép môi bằng OpenAvatar Runtime trên GPU local.
 - Xuất MP4, SRT, TXT và project JSON.
 
-## Kiến trúc OpenAvatar Runtime
+## Kiến trúc giọng local và OpenAvatar Runtime
 
 ```text
 PPT Video Studio trên Streamlit Cloud
@@ -38,6 +38,26 @@ http://127.0.0.1:8008
               ▼
 GPU NVIDIA local + Wav2Lip
 ```
+
+Voice clone là service riêng, không phải OpenAvatar Runtime:
+
+```text
+Storyboard / lời thuyết minh
+              │
+              ▼
+Local Voice Clone Service (F5-TTS)
+http://127.0.0.1:8009
+              │ WAV mono
+              ▼
+OpenAvatar Runtime / Wav2Lip
+http://127.0.0.1:8008
+              │
+              ▼
+Talking-head video
+```
+
+`8008` chỉ nhận audio đã có để nhép môi; không clone hoặc render giọng. Hướng
+dẫn cài Local Voice Clone Service ở [local_voice_clone/README.md](local_voice_clone/README.md).
 
 Streamlit Cloud không gọi trực tiếp `localhost`. Custom Streamlit Component trong repository này thực hiện request từ trình duyệt:
 
@@ -117,7 +137,24 @@ Trước khi hiện ô tải audio, ứng dụng yêu cầu mật khẩu. Sau kh
 
 ### Nhân bản giọng từ mẫu
 
-Chọn **Nhân bản giọng từ mẫu (API riêng)**, tải mẫu giọng rõ tiếng 15–60 giây, nhập endpoint của dịch vụ clone giọng và xác nhận quyền sử dụng giọng. Ứng dụng không đóng gói sẵn model clone giọng nặng; endpoint có thể là dịch vụ nội bộ hoặc GPU service do bạn kiểm soát. Hợp đồng endpoint ở [docs/VOICE_CLONE_API.md](docs/VOICE_CLONE_API.md).
+Chọn **Nhân bản giọng từ mẫu (API riêng)**, mở khóa tính năng tải giọng, tải
+mẫu giọng rõ tiếng và xác nhận quyền sử dụng giọng. Local service đi kèm chạy
+hoàn toàn trên máy, hỗ trợ `.wav`, `.mp3`, `.m4a`, `.aac`, `.ogg`, `.flac` và
+chuẩn hóa mẫu thành mono WAV trước khi F5-TTS chạy.
+
+Giá trị mặc định của form:
+
+```text
+Voice-clone API endpoint: http://127.0.0.1:8009/v1/voice-clone/synthesize
+Model:                    f5-tts
+API key:                  để trống
+Nội dung mẫu giọng:       transcript đúng với reference audio
+```
+
+WAV được ưu tiên làm source cho OpenAvatar/Wav2Lip; app tự yêu cầu WAV khi
+endpoint là local `127.0.0.1`. Endpoint có thể thay bằng service nội bộ khác
+do bạn kiểm soát. Xem [hợp đồng API](docs/VOICE_CLONE_API.md) và [cài service
+local](local_voice_clone/README.md).
 
 ## Giới hạn
 

@@ -1,0 +1,4 @@
+# Install this after a CPU/CUDA-compatible PyTorch has been chosen for the PC.
+-r requirements.txt
+f5-tts
+

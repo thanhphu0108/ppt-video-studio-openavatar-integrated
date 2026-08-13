@@ -10,15 +10,22 @@ PPT Video Studio hỗ trợ dịch vụ nhân bản giọng do đơn vị triể
 | --- | --- | --- | --- |
 | `reference_audio` | file | Có | File mẫu giọng người dùng tải lên. |
 | `text` | string | Có | Lời cần đọc của một slide. |
-| `model` | string | Có | Giá trị người dùng cấu hình, mặc định `default`. |
+| `model` | string | Có | Giá trị người dùng cấu hình, mặc định local là `f5-tts`. |
 | `reference_transcript` | string | Không | Transcript của mẫu giọng nếu model cần. |
-| `output_format` | string | Có | `mp3` (hoặc phần mở rộng audio đích). |
+| `reference_text` | string | Không | Tên tương đương ưu tiên của transcript cho Local Voice Clone Service. |
+| `output_format` | string | Có | `wav` hoặc `mp3`; local mặc định `wav`. |
+| `voice_use_consent` | boolean/string | Có với mẫu upload local | `true` khi người dùng đã xác nhận quyền sử dụng giọng. |
 
 Nếu người dùng nhập API key, ứng dụng thêm header:
 
 ```http
 Authorization: Bearer <API_KEY>
 ```
+
+Với Local Voice Clone Service ở `127.0.0.1:8009`, app còn gửi header
+`X-Voice-Upload-Password` **chỉ tới loopback** để bảo vệ audio mẫu. Header này
+không được gửi sang endpoint Internet. Service local chấp nhận cả JSON với
+`voice_id` (profile đã đăng ký) và multipart upload.
 
 ## Response
 
@@ -38,6 +45,23 @@ hoặc
 ```
 
 Với lỗi, trả HTTP 4xx/5xx và JSON có `error` hoặc `message` để app hiển thị nguyên nhân.
+
+Local service trả schema sau:
+
+```json
+{
+  "success": true,
+  "request_id": "uuid",
+  "model": "f5-tts",
+  "voice_id": "default",
+  "audio_path": "generated_audio/uuid.wav",
+  "audio_url": "http://127.0.0.1:8009/audio/uuid.wav",
+  "duration_seconds": 12.84
+}
+```
+
+Tài liệu cài, Swagger, batch Storyboard Excel và hook Wav2Lip nằm ở
+[local_voice_clone/README.md](../local_voice_clone/README.md).
 
 ## Bảo mật và quyền sử dụng giọng
 

@@ -1,0 +1,10 @@
+{
+  "default": {
+    "engine": "f5-tts",
+    "reference_audio": "voices/default/reference.wav",
+    "reference_text_file": "voices/default/transcript.txt",
+    "language": "vi",
+    "enabled": true
+  }
+}
+

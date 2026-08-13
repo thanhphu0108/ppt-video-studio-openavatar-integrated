@@ -6,6 +6,7 @@ import mimetypes
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -25,12 +26,21 @@ class VoiceCloneConfig:
     model: str = "default"
     api_key: str = ""
     reference_transcript: str = ""
+    voice_use_consent: bool = False
+    upload_password: str = ""
     timeout_seconds: int = 300
     verify_ssl: bool = True
 
 
 class VoiceCloneError(RuntimeError):
     pass
+
+
+def is_loopback_voice_clone_endpoint(endpoint: str) -> bool:
+    """True only for the local service; avoids sending a private password elsewhere."""
+
+    host = (urlparse(str(endpoint or "").strip()).hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
 
 
 def sanitize_voice_text(text: str, max_chars: int = 3200) -> str:
@@ -104,11 +114,16 @@ def synthesize_voice_clone_audio(
     headers = {"Accept": "audio/*, application/json"}
     if config.api_key.strip():
         headers["Authorization"] = f"Bearer {config.api_key.strip()}"
+    if config.upload_password and is_loopback_voice_clone_endpoint(config.endpoint):
+        # Local service uses this separate header for protected reference voice
+        # uploads. It is intentionally not an API key and is never logged.
+        headers["X-Voice-Upload-Password"] = config.upload_password
     data = {
         "text": narration,
         "model": config.model.strip() or "default",
         "reference_transcript": config.reference_transcript.strip(),
         "output_format": output_format,
+        "voice_use_consent": "true" if config.voice_use_consent else "false",
     }
 
     try:

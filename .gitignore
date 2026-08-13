@@ -53,3 +53,5 @@ local_voice_clone/voices/*/*.mp3
 # Logs / temp
 local_voice_clone/logs/
 local_voice_clone/tmp/
+/local_voice_clone
+/local_voice_clone

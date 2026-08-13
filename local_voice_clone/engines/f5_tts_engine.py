@@ -45,7 +45,21 @@ class F5TTSEngine(VoiceCloneEngine):
         self.model_dir = Path(
             os.getenv(
                 "F5_TTS_MODEL_DIR",
-                str(root / "models" / "F5-TTS" / "F5TTS_v1_Base"),
+                str(root / "models" / "F5-TTS" / self.model_name),
+            )
+        ).resolve()
+
+        self.ckpt_file = Path(
+            os.getenv(
+                "F5_TTS_CKPT_FILE",
+                str(self.model_dir / "model_1250000.safetensors"),
+            )
+        ).resolve()
+
+        self.vocab_file = Path(
+            os.getenv(
+                "F5_TTS_VOCAB_FILE",
+                str(self.model_dir / "vocab.txt"),
             )
         ).resolve()
         self.vocoder_dir = Path(
@@ -166,8 +180,8 @@ class F5TTSEngine(VoiceCloneEngine):
         # F5 checkpoint is validated only when we intend to bind it explicitly.
         # Some official F5 versions resolve the checkpoint from the HF cache
         # using the model name even in offline mode.
-        local_ckpt = self.model_dir / "model_1250000.safetensors"
-        local_vocab = self.model_dir / "vocab.txt"
+        local_ckpt = self.ckpt_file
+        local_vocab = self.vocab_file
 
         if not local_ckpt.exists():
             raise EngineUnavailableError(
@@ -227,8 +241,8 @@ class F5TTSEngine(VoiceCloneEngine):
 
             # Different F5-TTS releases expose different local checkpoint
             # parameter names. Bind only when the installed API supports them.
-            ckpt = self.model_dir / "model_1250000.safetensors"
-            vocab = self.model_dir / "vocab.txt"
+            ckpt = self.ckpt_file
+            vocab = self.vocab_file
 
             if "ckpt_file" in signature.parameters:
                 kwargs["ckpt_file"] = str(ckpt)
@@ -242,7 +256,12 @@ class F5TTSEngine(VoiceCloneEngine):
             self._error = ""
 
         except Exception as exc:
-            self._error = f"Không tải được F5-TTS: {exc}"
+            self._error = (
+                f"Không tải được F5-TTS: {exc} | "
+                f"model={self.model_name} | "
+                f"ckpt={self.ckpt_file} | "
+                f"vocab={self.vocab_file}"
+            )
             raise EngineUnavailableError(self._error) from exc
 
     def status(self) -> EngineStatus:
@@ -253,6 +272,10 @@ class F5TTSEngine(VoiceCloneEngine):
                 loaded=True,
                 device=self._resolved_device,
                 model=self.model_name,
+                message=(
+                    f"checkpoint={self.ckpt_file.name}; "
+                    f"vocab={self.vocab_file.name}"
+                ),
             )
 
         try:

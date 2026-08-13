@@ -7,10 +7,6 @@ import re
 import tempfile
 import hashlib
 import time
-import subprocess
-import base64
-import requests
-import imageio_ffmpeg
 from dataclasses import asdict
 from pathlib import Path
 
@@ -115,14 +111,6 @@ def init_state() -> None:
         st.session_state.local_batch_auto_export = False
     if "auto_export_requested" not in st.session_state:
         st.session_state.auto_export_requested = False
-    if "scene_audio_overrides" not in st.session_state:
-        st.session_state.scene_audio_overrides = {}
-    if "master_recording_payload" not in st.session_state:
-        st.session_state.master_recording_payload = None
-    if "master_recording_name" not in st.session_state:
-        st.session_state.master_recording_name = ""
-    if "master_recording_ranges" not in st.session_state:
-        st.session_state.master_recording_ranges = {}
 
 
 init_state()
@@ -304,84 +292,6 @@ def uploaded_audio_assets(files: list[st.runtime.uploaded_file_manager.UploadedF
             continue
         assets[slot] = AudioAsset(data=payload, filename=uploaded_file.name)
     return assets, errors
-
-
-
-def _parse_timecode(value: str) -> float:
-    """Accept SS, MM:SS, MM:SS.mmm or HH:MM:SS.mmm and return seconds."""
-    raw = str(value or "").strip().replace(",", ".")
-    if not raw:
-        raise ValueError("timecode trống")
-    parts = raw.split(":")
-    try:
-        nums = [float(part) for part in parts]
-    except ValueError as exc:
-        raise ValueError(f"timecode không hợp lệ: {value}") from exc
-    if len(nums) == 1:
-        seconds = nums[0]
-    elif len(nums) == 2:
-        seconds = nums[0] * 60 + nums[1]
-    elif len(nums) == 3:
-        seconds = nums[0] * 3600 + nums[1] * 60 + nums[2]
-    else:
-        raise ValueError(f"timecode không hợp lệ: {value}")
-    if seconds < 0:
-        raise ValueError("timecode không được âm")
-    return seconds
-
-
-def _slice_master_audio(
-    payload: bytes,
-    filename: str,
-    start_seconds: float,
-    end_seconds: float,
-    scene_key: int | str,
-) -> AudioAsset:
-    """Cut one scene from a long uploaded recording and normalize to WAV."""
-    if not payload:
-        raise ValueError("Chưa tải file thu âm tổng.")
-    if end_seconds <= start_seconds:
-        raise ValueError("Thời điểm kết thúc phải lớn hơn bắt đầu.")
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="ppt_audio_slice_"))
-    suffix = Path(filename or "master_audio.wav").suffix or ".wav"
-    source = temp_dir / f"master{suffix}"
-    target = temp_dir / f"scene_{scene_key}.wav"
-    source.write_bytes(payload)
-
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    command = [
-        ffmpeg, "-y",
-        "-ss", f"{start_seconds:.3f}",
-        "-to", f"{end_seconds:.3f}",
-        "-i", str(source),
-        "-vn",
-        "-ac", "1",
-        "-ar", "48000",
-        "-c:a", "pcm_s16le",
-        str(target),
-    ]
-    completed = subprocess.run(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if completed.returncode != 0 or not target.exists() or target.stat().st_size == 0:
-        detail = (completed.stderr or "")[-1200:]
-        raise RuntimeError(f"Không cắt được audio cho {scene_key}: {detail}")
-    return AudioAsset(data=target.read_bytes(), filename=target.name)
-
-
-def _effective_scene_audio(
-    scene_key: int | str,
-    recorded_assets: dict[int | str, AudioAsset],
-) -> AudioAsset | None:
-    """Priority: dashboard override/master slice -> ordinary uploaded per-slide file."""
-    override = st.session_state.scene_audio_overrides.get(scene_key)
-    if isinstance(override, AudioAsset):
-        return override
-    return recorded_assets.get(scene_key)
 
 
 def audio_asset_for_scene(scene: VideoScene, assets: dict[int | str, AudioAsset]) -> AudioAsset | None:
@@ -734,182 +644,6 @@ def _job_dashboard_frame(items: list[dict]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
-
-
-
-def _direct_voice_clone_synthesize(
-    *,
-    endpoint: str,
-    reference_audio: bytes,
-    reference_filename: str,
-    text: str,
-    reference_text: str,
-    voice_id: str,
-    model: str,
-    api_key: str,
-    upload_password: str,
-    voice_use_consent: bool,
-    request_id: str,
-) -> dict | None:
-    """Call Local Voice Clone directly from Python.
-
-    This is the preferred path when Streamlit is running on the same Windows
-    machine as port 8009. It avoids the Streamlit browser component being
-    re-rendered and accidentally issuing the same very expensive Vira request
-    multiple times.
-
-    Return None only when Python cannot connect to the endpoint, allowing the
-    existing Browser Bridge to remain as a Cloud fallback.
-    """
-    read_timeout = max(
-        60,
-        int(os.getenv("VOICE_CLONE_TIMEOUT_SECONDS", "7200")),
-    )
-
-    headers: dict[str, str] = {}
-    if api_key:
-        headers["X-API-Key"] = api_key
-    if upload_password:
-        headers["X-Voice-Upload-Password"] = upload_password
-
-    files = {
-        "reference_audio": (
-            reference_filename or "reference.wav",
-            reference_audio,
-            "audio/wav",
-        )
-    }
-    data = {
-        "text": text,
-        "reference_text": reference_text or "",
-        "voice_id": voice_id or "default",
-        "model": model or "vira-tts",
-        "language": "vi",
-        "speed": "1.0",
-        "output_format": "wav",
-        "voice_use_consent": "true" if voice_use_consent else "false",
-        "return_audio": "true",
-    }
-
-    try:
-        response = requests.post(
-            endpoint,
-            headers=headers,
-            files=files,
-            data=data,
-            timeout=(8, read_timeout),
-        )
-    except requests.exceptions.ConnectionError:
-        # Typical Streamlit-Cloud case: localhost:8009 belongs to the browser
-        # machine, not the Python server. Fall back to Browser Bridge.
-        return None
-    except requests.exceptions.Timeout as exc:
-        return {
-            "ok": False,
-            "error": (
-                f"Voice Clone timeout sau {read_timeout}s: {exc}. "
-                "Audio đã tạo ở 8009 có thể vẫn còn trong cache."
-            ),
-            "request_id": request_id,
-        }
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "error": f"Không gọi được Voice Clone bằng Python: {exc}",
-            "request_id": request_id,
-        }
-
-    if not response.ok:
-        detail = ""
-        try:
-            payload = response.json()
-            detail = (
-                payload.get("message")
-                or payload.get("detail")
-                or payload.get("error")
-                or str(payload)
-            )
-        except Exception:
-            detail = response.text[-2000:]
-        return {
-            "ok": False,
-            "error": f"Voice Clone HTTP {response.status_code}: {detail}",
-            "request_id": request_id,
-        }
-
-    content_type = (response.headers.get("content-type") or "").lower()
-
-    if (
-        content_type.startswith("audio/")
-        or "application/octet-stream" in content_type
-        or response.content[:4] == b"RIFF"
-    ):
-        return {
-            "ok": True,
-            "kind": "audio",
-            "audio_base64": base64.b64encode(response.content).decode("ascii"),
-            "content_type": content_type or "audio/wav",
-            "request_id": request_id,
-            "transport": "python-direct",
-            "cache_hit": False,
-        }
-
-    try:
-        payload = response.json()
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": f"Voice Clone trả response không đọc được: {exc}",
-            "request_id": request_id,
-        }
-
-    if payload.get("audio_base64"):
-        return {
-            "ok": True,
-            "kind": "audio",
-            "audio_base64": payload["audio_base64"],
-            "content_type": payload.get("content_type", "audio/wav"),
-            "payload": payload,
-            "request_id": request_id,
-            "transport": "python-direct",
-            "cache_hit": bool(payload.get("cache_hit")),
-        }
-
-    if payload.get("audio_url"):
-        try:
-            audio_response = requests.get(
-                payload["audio_url"],
-                timeout=(8, 300),
-            )
-            audio_response.raise_for_status()
-        except requests.RequestException as exc:
-            return {
-                "ok": False,
-                "error": f"Không tải được WAV đã synthesize: {exc}",
-                "request_id": request_id,
-            }
-
-        return {
-            "ok": True,
-            "kind": "audio",
-            "audio_base64": base64.b64encode(
-                audio_response.content
-            ).decode("ascii"),
-            "content_type": (
-                audio_response.headers.get("content-type")
-                or "audio/wav"
-            ),
-            "payload": payload,
-            "request_id": request_id,
-            "transport": "python-direct",
-            "cache_hit": bool(payload.get("cache_hit")),
-        }
-
-    return {
-        "ok": False,
-        "error": "Voice Clone không trả audio binary, audio_base64 hoặc audio_url.",
-        "request_id": request_id,
-    }
 
 
 def _queue_unique(items: list) -> list:
@@ -1619,180 +1353,6 @@ with tab_export:
                     "Nếu không có lời: Audio = N/A, Lip-sync = N/A và không tốn GPU."
                 )
 
-                with st.expander("🎙️ Audio ngoài theo từng slide / cắt từ một bản thu dài", expanded=False):
-                    st.caption(
-                        "Có thể thay audio AI cho từng scene. Ưu tiên: audio chọn ở đây → "
-                        "audio upload theo tên slide → Vira-TTS. Timecode nhận MM:SS hoặc HH:MM:SS."
-                    )
-
-                    master_file = st.file_uploader(
-                        "Bản thu âm dài (tùy chọn)",
-                        type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
-                        key="dashboard_master_recording",
-                        help="Ví dụ một file thu 30 phút; sau đó khai báo Slide 1 từ 00:15 đến 01:05, Slide 2 từ 01:05 đến 02:10...",
-                    )
-                    if master_file is not None:
-                        payload = master_file.getvalue()
-                        if (
-                            payload
-                            and (
-                                st.session_state.master_recording_name != master_file.name
-                                or st.session_state.master_recording_payload != payload
-                            )
-                        ):
-                            st.session_state.master_recording_payload = payload
-                            st.session_state.master_recording_name = master_file.name
-
-                    if st.session_state.master_recording_payload:
-                        st.audio(st.session_state.master_recording_payload)
-
-                    range_rows = []
-                    for item in pipeline_items:
-                        if not item["needs_audio"]:
-                            continue
-                        old_range = st.session_state.master_recording_ranges.get(
-                            item["key"], {}
-                        )
-                        range_rows.append(
-                            {
-                                "Scene": item["label"],
-                                "Key": str(item["key"]),
-                                "Dùng bản thu dài": bool(old_range.get("enabled", False)),
-                                "Bắt đầu": str(old_range.get("start", "")),
-                                "Kết thúc": str(old_range.get("end", "")),
-                            }
-                        )
-
-                    if range_rows:
-                        range_df = st.data_editor(
-                            pd.DataFrame(range_rows),
-                            hide_index=True,
-                            use_container_width=True,
-                            disabled=["Scene", "Key"],
-                            column_config={
-                                "Dùng bản thu dài": st.column_config.CheckboxColumn(),
-                                "Bắt đầu": st.column_config.TextColumn(
-                                    help="MM:SS hoặc HH:MM:SS.mmm"
-                                ),
-                                "Kết thúc": st.column_config.TextColumn(
-                                    help="MM:SS hoặc HH:MM:SS.mmm"
-                                ),
-                            },
-                            key="master_audio_range_editor",
-                        )
-
-                        if st.button(
-                            "✂️ Áp dụng timecode vào các slide",
-                            use_container_width=True,
-                            key="apply_master_audio_ranges",
-                        ):
-                            if not st.session_state.master_recording_payload:
-                                st.error("Hãy tải bản thu âm dài trước.")
-                            else:
-                                key_lookup = {
-                                    str(item["key"]): item["key"]
-                                    for item in pipeline_items
-                                }
-                                applied = 0
-                                errors = []
-                                for _, row in range_df.iterrows():
-                                    scene_key = key_lookup.get(str(row["Key"]))
-                                    if scene_key is None:
-                                        continue
-                                    enabled = bool(row["Dùng bản thu dài"])
-                                    start_raw = str(row["Bắt đầu"] or "").strip()
-                                    end_raw = str(row["Kết thúc"] or "").strip()
-                                    st.session_state.master_recording_ranges[scene_key] = {
-                                        "enabled": enabled,
-                                        "start": start_raw,
-                                        "end": end_raw,
-                                    }
-                                    if not enabled:
-                                        continue
-                                    try:
-                                        start_s = _parse_timecode(start_raw)
-                                        end_s = _parse_timecode(end_raw)
-                                        asset = _slice_master_audio(
-                                            st.session_state.master_recording_payload,
-                                            st.session_state.master_recording_name,
-                                            start_s,
-                                            end_s,
-                                            scene_key,
-                                        )
-                                        st.session_state.scene_audio_overrides[scene_key] = asset
-                                        st.session_state.local_avatar_audio[scene_key] = asset.data
-                                        # Audio changed: any old lip-sync clip is now stale.
-                                        st.session_state.local_avatar_clips.pop(scene_key, None)
-                                        st.session_state.local_audio_hashes.pop(scene_key, None)
-                                        st.session_state.local_avatar_hashes.pop(scene_key, None)
-                                        _set_local_job(
-                                            scene_key,
-                                            "Done",
-                                            "External audio ready",
-                                            cache_source="master-recording",
-                                        )
-                                        applied += 1
-                                    except Exception as exc:
-                                        errors.append(
-                                            f"{item_by_key[scene_key]['label']}: {exc}"
-                                        )
-                                if errors:
-                                    st.error("\n".join(errors))
-                                if applied:
-                                    st.success(f"Đã cắt và gán audio cho {applied} scene.")
-                                    st.rerun()
-
-                    st.markdown("**Upload/đổi audio riêng cho một slide**")
-                    override_scene = st.selectbox(
-                        "Scene cần thay audio",
-                        [item["key"] for item in pipeline_items if item["needs_audio"]],
-                        format_func=lambda key: item_by_key[key]["label"],
-                        key="dashboard_audio_override_scene",
-                    )
-                    override_file = st.file_uploader(
-                        "Chọn file audio cho scene này",
-                        type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
-                        key=f"dashboard_audio_override_file_{override_scene}",
-                    )
-                    oc1, oc2 = st.columns(2)
-                    if oc1.button(
-                        "Dùng audio này",
-                        use_container_width=True,
-                        disabled=override_file is None,
-                        key="dashboard_apply_audio_override",
-                    ):
-                        payload = override_file.getvalue() if override_file else b""
-                        if payload:
-                            asset = AudioAsset(
-                                data=payload,
-                                filename=override_file.name,
-                            )
-                            st.session_state.scene_audio_overrides[override_scene] = asset
-                            st.session_state.local_avatar_audio[override_scene] = payload
-                            st.session_state.local_avatar_clips.pop(override_scene, None)
-                            st.session_state.local_audio_hashes.pop(override_scene, None)
-                            st.session_state.local_avatar_hashes.pop(override_scene, None)
-                            _set_local_job(
-                                override_scene,
-                                "Done",
-                                "External audio ready",
-                                cache_source="manual-upload",
-                            )
-                            st.rerun()
-
-                    if oc2.button(
-                        "Bỏ audio ngoài của scene",
-                        use_container_width=True,
-                        key="dashboard_clear_audio_override",
-                    ):
-                        st.session_state.scene_audio_overrides.pop(override_scene, None)
-                        st.session_state.local_avatar_audio.pop(override_scene, None)
-                        st.session_state.local_avatar_clips.pop(override_scene, None)
-                        st.session_state.local_audio_hashes.pop(override_scene, None)
-                        st.session_state.local_avatar_hashes.pop(override_scene, None)
-                        _set_local_job(override_scene, "Pending", "Audio")
-                        st.rerun()
-
                 a1, a2, a3, a4 = st.columns(4)
                 create_audio = a1.button(
                     "1. Tạo / cập nhật audio",
@@ -2004,96 +1564,22 @@ with tab_export:
                         voice_id,
                         voice_rate,
                     )
-                    # Re-check persistent disk cache immediately before making
-                    # an expensive GPU request. This protects against Streamlit
-                    # reruns/restarts and against the same scene being queued twice.
-                    restored_now = False
-                    if current_key not in st.session_state.local_avatar_audio:
-                        try:
-                            restored_now = _restore_audio_from_disk(
-                                current_key,
-                                audio_cache_key,
-                            )
-                        except Exception:
-                            restored_now = False
-
-                    if restored_now:
-                        _set_local_job(
-                            current_key,
-                            "Cached",
-                            "Audio ready",
-                            cache_source="disk",
-                        )
-                        st.session_state.local_voice_queue = list(voice_queue[1:])
-
-                        if (
-                            not st.session_state.local_voice_queue
-                            and st.session_state.local_continue_avatar_targets
-                        ):
-                            targets = list(
-                                st.session_state.local_continue_avatar_targets
-                            )
-                            st.session_state.local_avatar_queue = _queue_unique(
-                                [
-                                    key
-                                    for key in targets
-                                    if key in st.session_state.local_avatar_audio
-                                    and key not in st.session_state.local_avatar_clips
-                                ]
-                            )
-                            st.session_state.local_continue_avatar_targets = []
-
-                        st.rerun()
-
-                    # FAST local path. A blocking Python request executes exactly
-                    # once per Streamlit run, unlike an auto-executing browser
-                    # component which may be rendered repeatedly.
-                    use_direct_python = (
-                        os.getenv("VOICE_CLONE_DIRECT_PYTHON", "true")
-                        .strip()
-                        .lower()
-                        in {"1", "true", "yes", "on"}
+                    voice_result = local_gpu_bridge(
+                        action="voice_synthesize",
+                        agent_url=voice_base_url,
+                        reference_audio_bytes=voice_clone_config.reference_audio,
+                        reference_audio_filename=voice_clone_config.reference_filename,
+                        text=current_item["narration"],
+                        reference_text=voice_clone_config.reference_transcript or "",
+                        voice_id="default",
+                        model=voice_clone_config.model or "f5-tts",
+                        api_key=voice_clone_config.api_key or "",
+                        voice_use_consent=bool(voice_clone_config.voice_use_consent),
+                        upload_password=voice_clone_config.upload_password or "",
+                        request_id=f"voice-scene-{current_key}",
+                        cache_key=audio_cache_key,
+                        key=f"voice_clone_scene_{current_key}",
                     )
-
-                    voice_result = None
-                    if use_direct_python:
-                        voice_result = _direct_voice_clone_synthesize(
-                            endpoint=clone_endpoint,
-                            reference_audio=voice_clone_config.reference_audio,
-                            reference_filename=voice_clone_config.reference_filename,
-                            text=current_item["narration"],
-                            reference_text=voice_clone_config.reference_transcript or "",
-                            voice_id="default",
-                            model=voice_clone_config.model or "vira-tts",
-                            api_key=voice_clone_config.api_key or "",
-                            upload_password=voice_clone_config.upload_password or "",
-                            voice_use_consent=bool(
-                                voice_clone_config.voice_use_consent
-                            ),
-                            request_id=f"voice-scene-{current_key}",
-                        )
-
-                    # Cloud fallback: Python cannot reach the user's localhost,
-                    # therefore let the browser call 8009.
-                    if voice_result is None:
-                        voice_result = local_gpu_bridge(
-                            action="voice_synthesize",
-                            agent_url=voice_base_url,
-                            reference_audio_bytes=voice_clone_config.reference_audio,
-                            reference_audio_filename=voice_clone_config.reference_filename,
-                            text=current_item["narration"],
-                            reference_text=voice_clone_config.reference_transcript or "",
-                            voice_id="default",
-                            model=voice_clone_config.model or "f5-tts",
-                            api_key=voice_clone_config.api_key or "",
-                            voice_use_consent=bool(
-                                voice_clone_config.voice_use_consent
-                            ),
-                            upload_password=voice_clone_config.upload_password or "",
-                            request_id=f"voice-scene-{current_key}",
-                            cache_key=audio_cache_key,
-                            key=f"voice_clone_scene_{current_key}",
-                        )
 
                     if isinstance(voice_result, dict) and voice_result.get("ok"):
                         # Browser Bridge may return the service request_id instead of
@@ -2125,12 +1611,8 @@ with tab_export:
                                     ),
                                 )
                             else:
-                                transport = voice_result.get("transport", "")
                                 _set_local_job(
-                                    current_key,
-                                    "Done",
-                                    "Audio ready",
-                                    cache_source=transport,
+                                    current_key, "Done", "Audio ready"
                                 )
 
                             st.session_state.local_job_failed_stage.pop(
@@ -2378,7 +1860,7 @@ with tab_export:
             use_container_width=True,
         )
         auto_export_now = bool(
-            st.session_state.get("auto_export_requested", False)
+            st.session_state.pop("auto_export_requested", False)
         )
         if auto_export_now:
             st.success(
@@ -2516,19 +1998,10 @@ with tab_export:
                     scene_audio_assets = []
                     for scene in scenes:
                         slide_key = _scene_runtime_key(scene)
-                        override_asset = (
-                            st.session_state.scene_audio_overrides.get(slide_key)
+                        audio_bytes = (
+                            st.session_state.local_avatar_audio.get(slide_key)
                             if slide_key is not None
                             else None
-                        )
-                        audio_bytes = (
-                            override_asset.data
-                            if isinstance(override_asset, AudioAsset)
-                            else (
-                                st.session_state.local_avatar_audio.get(slide_key)
-                                if slide_key is not None
-                                else None
-                            )
                         )
 
                         # Boundary scene có thể có bản thu upload riêng.
@@ -2666,10 +2139,7 @@ with tab_export:
                             "dictionary": json.loads(dictionary_json(st.session_state.dictionary)),
                             "storyboard": records,
                         }
-                        st.session_state.auto_export_requested = False
-                        st.session_state.local_batch_auto_export = False
-                        st.session_state.local_batch_mode = False
-                        st.success("Đã tạo video tổng hợp hoàn chỉnh.")
+                        st.success("Đã tạo video.")
                         st.video(output.read_bytes())
                         d1, d2, d3, d4 = st.columns(4)
                         d1.download_button("Tải MP4", output.read_bytes(), "ppt_video.mp4", "video/mp4")
@@ -2683,9 +2153,3 @@ with tab_export:
                         d4.download_button("Tải project", json.dumps(project, ensure_ascii=False, indent=2).encode("utf-8"), "ppt_video_project.json", "application/json")
                 except Exception as exc:
                     st.error(f"Không tạo được video: {exc}")
-                    if auto_export_now:
-                        st.warning(
-                            "All-in-One vẫn đang chờ xuất video. "
-                            "Sửa lỗi cấu hình rồi app sẽ thử xuất lại; "
-                            "audio/clip đã render không bị mất."
-                        )

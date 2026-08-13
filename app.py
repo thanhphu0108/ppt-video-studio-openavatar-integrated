@@ -153,6 +153,7 @@ def reset_presentation_editing_state() -> None:
         "voice_clone_transcript",
         "voice_clone_verify_ssl",
         "voice_clone_consent",
+        "local_voice_upload_password",
     ):
         st.session_state.pop(key, None)
     st.session_state.intro_upload = None
@@ -181,7 +182,6 @@ def clear_voice_upload_session() -> None:
     for key in (
         "voice_upload_unlocked",
         "voice_upload_password",
-        "voice_upload_verified_password",
         "recorded_voice_files",
         "voice_clone_reference",
         "voice_clone_endpoint",
@@ -216,10 +216,6 @@ def unlock_voice_uploads() -> bool:
             password,
             configured_password=configured_voice_upload_password(),
         ):
-            # Keep a durable copy outside the text_input widget key.
-            # Streamlit may remove widget-backed state when the widget is not
-            # rendered on the next rerun after the session is unlocked.
-            st.session_state.voice_upload_verified_password = str(password or "")
             st.session_state.voice_upload_unlocked = True
             st.rerun()
         else:
@@ -666,6 +662,17 @@ with tab_export:
                     type="password",
                     key="voice_clone_api_key",
                 )
+                local_voice_upload_password = st.text_input(
+                    "Mật khẩu Local Voice Clone (8009)",
+                    value=os.getenv("LOCAL_VOICE_UPLOAD_PASSWORD", ""),
+                    type="password",
+                    key="local_voice_upload_password",
+                    help=(
+                        "Mật khẩu mà service 127.0.0.1:8009 dùng để cho phép "
+                        "reference_audio. Đây là mật khẩu riêng, không nhất thiết "
+                        "giống mật khẩu mở khóa upload trên Streamlit."
+                    ),
+                )
                 clone_transcript = st.text_area(
                     "Nội dung của mẫu giọng (không bắt buộc)",
                     height=74,
@@ -688,9 +695,7 @@ with tab_export:
                         api_key=clone_api_key,
                         reference_transcript=clone_transcript,
                         voice_use_consent=voice_clone_consent,
-                        upload_password=str(
-                            st.session_state.get("voice_upload_verified_password", "")
-                        ),
+                        upload_password=str(local_voice_upload_password or ""),
                         verify_ssl=clone_verify_ssl,
                     )
                 st.info(

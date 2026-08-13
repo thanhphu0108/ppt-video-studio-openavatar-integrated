@@ -102,7 +102,16 @@ async function execute(){
       fd.append('speed','1.0');
       fd.append('output_format','wav');
       fd.append('return_audio','true');
-
+        console.log(
+            'voice bridge debug',
+            {
+                upload_password_present: !!args.upload_password,
+                upload_password_length: (args.upload_password || '').length,
+                api_key_present: !!args.api_key,
+                api_key_length: (args.api_key || '').length,
+                consent: !!args.voice_use_consent
+            }
+        );
       const headers={};
       if(args.api_key) headers['X-API-Key']=args.api_key;
       if(args.upload_password) headers['X-Voice-Upload-Password']=args.upload_password;

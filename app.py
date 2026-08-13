@@ -181,6 +181,7 @@ def clear_voice_upload_session() -> None:
     for key in (
         "voice_upload_unlocked",
         "voice_upload_password",
+        "voice_upload_verified_password",
         "recorded_voice_files",
         "voice_clone_reference",
         "voice_clone_endpoint",
@@ -215,6 +216,10 @@ def unlock_voice_uploads() -> bool:
             password,
             configured_password=configured_voice_upload_password(),
         ):
+            # Keep a durable copy outside the text_input widget key.
+            # Streamlit may remove widget-backed state when the widget is not
+            # rendered on the next rerun after the session is unlocked.
+            st.session_state.voice_upload_verified_password = str(password or "")
             st.session_state.voice_upload_unlocked = True
             st.rerun()
         else:
@@ -683,7 +688,9 @@ with tab_export:
                         api_key=clone_api_key,
                         reference_transcript=clone_transcript,
                         voice_use_consent=voice_clone_consent,
-                        upload_password=str(st.session_state.get("voice_upload_password", "")),
+                        upload_password=str(
+                            st.session_state.get("voice_upload_verified_password", "")
+                        ),
                         verify_ssl=clone_verify_ssl,
                     )
                 st.info(

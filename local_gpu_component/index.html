@@ -102,36 +102,9 @@ async function execute(){
       fd.append('speed','1.0');
       fd.append('output_format','wav');
       fd.append('return_audio','true');
-        console.log(
-            'voice bridge debug',
-            {
-                upload_password_present: !!args.upload_password,
-                upload_password_length: (args.upload_password || '').length,
-                api_key_present: !!args.api_key,
-                api_key_length: (args.api_key || '').length,
-                consent: !!args.voice_use_consent
-            }
-        );
       const headers={};
       if(args.api_key) headers['X-API-Key']=args.api_key;
       if(args.upload_password) headers['X-Voice-Upload-Password']=args.upload_password;
-
-      // Safe on-screen diagnostics: never expose the secret values themselves.
-      const debugInfo = {
-        api_key_present: !!args.api_key,
-        api_key_length: String(args.api_key || '').length,
-        upload_password_present: !!args.upload_password,
-        upload_password_length: String(args.upload_password || '').length,
-        consent: !!args.voice_use_consent,
-        reference_text_present: !!args.reference_text,
-        reference_text_length: String(args.reference_text || '').length
-      };
-      statusEl.className='muted';
-      statusEl.textContent =
-        'Bridge debug — API key: '+(debugInfo.api_key_present ? 'có ('+debugInfo.api_key_length+')' : 'KHÔNG')+
-        ' | Upload password: '+(debugInfo.upload_password_present ? 'có ('+debugInfo.upload_password_length+')' : 'KHÔNG')+
-        ' | Consent: '+debugInfo.consent+
-        ' | Ref text: '+(debugInfo.reference_text_present ? 'có ('+debugInfo.reference_text_length+')' : 'KHÔNG');
 
       const r=await fetch(base+'/v1/voice-clone/synthesize',{
         method:'POST',headers,body:fd
@@ -145,13 +118,7 @@ async function execute(){
         }catch(_){
           try{ detail=await r.text(); }catch(__){}
         }
-        throw new Error(
-          'HTTP '+r.status+(detail ? ': '+detail : '')+
-          ' | debug: api_key='+(debugInfo.api_key_present ? debugInfo.api_key_length : 0)+
-          ', upload_password='+(debugInfo.upload_password_present ? debugInfo.upload_password_length : 0)+
-          ', consent='+debugInfo.consent+
-          ', reference_text='+(debugInfo.reference_text_present ? debugInfo.reference_text_length : 0)
-        );
+        throw new Error('HTTP '+r.status+(detail ? ': '+detail : ''));
       }
 
       const ct=(r.headers.get('content-type')||'').toLowerCase();

@@ -889,25 +889,43 @@ with tab_export:
             if avatar_image is None:
                 st.warning("Hãy tải ảnh người dẫn để dùng OpenAvatar Runtime.")
             else:
-                if st.button("Chuẩn bị audio cho OpenAvatar Runtime", use_container_width=True):
+                st.markdown("#### Quy trình Local AI")
+                st.caption("Tạo audio trước để nghe kiểm tra. Khi giọng đã ổn mới chạy nhép môi. Các bước GPU chạy tuần tự để tránh tranh VRAM.")
+
+                eligible_slides = [
+                    rec["slide"] for rec in records
+                    if not rec.get("skip") and rec.get("narration", "").strip()
+                ]
+
+                status_rows = []
+                for slide in eligible_slides:
+                    status_rows.append({
+                        "Slide": slide,
+                        "Audio": "✓ Sẵn sàng" if slide in st.session_state.local_avatar_audio else "Chưa tạo",
+                        "Nhép môi": "✓ Sẵn sàng" if slide in st.session_state.local_avatar_clips else "Chưa tạo",
+                    })
+                if status_rows:
+                    st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+
+                c_audio, c_lipsync = st.columns(2)
+                create_audio = c_audio.button("1. Tạo audio để nghe thử", use_container_width=True)
+                create_lipsync = c_lipsync.button(
+                    "2. Tạo nhép môi cho tất cả slide",
+                    use_container_width=True,
+                    disabled=not bool(st.session_state.local_avatar_audio),
+                )
+
+                if create_audio:
                     try:
                         st.session_state.local_avatar_audio = {}
                         st.session_state.local_avatar_clips = {}
                         st.session_state.local_avatar_queue = []
                         st.session_state.local_voice_queue = []
 
-                        selected_slides = [
-                            rec["slide"]
-                            for rec in records
-                            if not rec.get("skip") and rec.get("narration", "").strip()
-                        ]
-
                         if voice_engine == "voice_clone":
                             if voice_clone_config is None:
                                 raise RuntimeError("Chưa cấu hình Voice Clone.")
-                            # IMPORTANT: do not synthesize on Streamlit Cloud.
-                            # Queue browser-side calls to localhost:8009 instead.
-                            st.session_state.local_voice_queue = selected_slides
+                            st.session_state.local_voice_queue = eligible_slides
                         else:
                             prep_dir = Path(tempfile.mkdtemp(prefix="local_avatar_audio_"))
                             for rec in records:
@@ -916,101 +934,92 @@ with tab_export:
                                 audio_path = prep_dir / f"slide_{rec['slide']:03}.mp3"
                                 text_value = apply_dictionary(rec["narration"], st.session_state.dictionary)
                                 source_scene = VideoScene(
-                                    title=rec["title"],
-                                    narration=text_value,
+                                    title=rec["title"], narration=text_value,
                                     source_slide_number=rec["slide"],
                                 )
                                 prepared_audio = synthesize_scene_audio(
-                                    source_scene,
-                                    audio_path,
-                                    voice_engine=voice_engine,
-                                    voice_id=voice_id,
+                                    source_scene, audio_path,
+                                    voice_engine=voice_engine, voice_id=voice_id,
                                     voice_rate=voice_rate,
                                     voice_clone_config=voice_clone_config,
                                     uploaded_audio=audio_asset_for_scene(source_scene, recorded_voice_assets),
                                 )
                                 if prepared_audio and prepared_audio.exists():
                                     st.session_state.local_avatar_audio[rec["slide"]] = prepared_audio.read_bytes()
-
-                            st.session_state.local_avatar_queue = selected_slides
-
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"Không chuẩn bị được audio cho OpenAvatar Runtime: {exc}")
+                        st.error(f"Không tạo được audio: {exc}")
 
-                # Voice Clone must run in the user's browser when Streamlit is on Cloud,
-                # because localhost:8009 belongs to the user's PC, not Streamlit Cloud.
                 voice_queue = st.session_state.local_voice_queue
                 if voice_queue:
                     current_slide = voice_queue[0]
-                    current_rec = next(
-                        (rec for rec in records if rec["slide"] == current_slide),
-                        None,
-                    )
+                    current_rec = next((rec for rec in records if rec["slide"] == current_slide), None)
                     if current_rec is None:
                         st.session_state.local_voice_queue = voice_queue[1:]
                         st.rerun()
 
                     clone_endpoint = voice_clone_config.endpoint.rstrip("/")
                     marker = "/v1/voice-clone/synthesize"
-                    voice_base_url = (
-                        clone_endpoint[:-len(marker)]
-                        if clone_endpoint.endswith(marker)
-                        else clone_endpoint
-                    )
+                    voice_base_url = clone_endpoint[:-len(marker)] if clone_endpoint.endswith(marker) else clone_endpoint
 
-                    voice_progress_done = len(st.session_state.local_avatar_audio)
-                    voice_progress_total = voice_progress_done + len(voice_queue)
-                    st.progress(
-                        voice_progress_done / max(1, voice_progress_total),
-                        text=f"F5-TTS local đang tạo audio cho slide {current_slide}",
-                    )
+                    done_count = len(st.session_state.local_avatar_audio)
+                    total_count = done_count + len(voice_queue)
+                    st.progress(done_count / max(1, total_count), text=f"F5-TTS: slide {current_slide} ({done_count + 1}/{total_count})")
 
                     voice_result = local_gpu_bridge(
-                        action="voice_synthesize",
-                        agent_url=voice_base_url,
+                        action="voice_synthesize", agent_url=voice_base_url,
                         reference_audio_bytes=voice_clone_config.reference_audio,
                         reference_audio_filename=voice_clone_config.reference_filename,
-                        text=apply_dictionary(
-                            current_rec["narration"],
-                            st.session_state.dictionary,
-                        ),
+                        text=apply_dictionary(current_rec["narration"], st.session_state.dictionary),
                         reference_text=voice_clone_config.reference_transcript or "",
-                        voice_id="default",
-                        model=voice_clone_config.model or "f5-tts",
+                        voice_id="default", model=voice_clone_config.model or "f5-tts",
                         api_key=voice_clone_config.api_key or "",
                         voice_use_consent=bool(voice_clone_config.voice_use_consent),
                         upload_password=voice_clone_config.upload_password or "",
-                        request_id=f"voice-slide-{current_slide}",
-                        key=f"voice_clone_{current_slide}",
+                        request_id=f"voice-slide-{current_slide}", key=f"voice_clone_{current_slide}",
                     )
-
-                    if (
-                        isinstance(voice_result, dict)
-                        and voice_result.get("ok")
-                        and voice_result.get("request_id") == f"voice-slide-{current_slide}"
-                    ):
+                    if isinstance(voice_result, dict) and voice_result.get("ok") and voice_result.get("request_id") == f"voice-slide-{current_slide}":
                         audio_bytes = decode_audio_result(voice_result)
                         if audio_bytes:
                             st.session_state.local_avatar_audio[current_slide] = audio_bytes
                             st.session_state.local_voice_queue = voice_queue[1:]
-                            if not st.session_state.local_voice_queue:
-                                st.session_state.local_avatar_queue = list(
-                                    st.session_state.local_avatar_audio.keys()
-                                )
                             st.rerun()
                     elif isinstance(voice_result, dict) and voice_result.get("ok") is False:
-                        st.error(
-                            voice_result.get(
-                                "error",
-                                "Local Voice Clone xử lý thất bại",
-                            )
-                        )
+                        st.error(voice_result.get("error", "Local Voice Clone xử lý thất bại"))
+
+                if st.session_state.local_avatar_audio and not st.session_state.local_voice_queue:
+                    st.success(f"Đã tạo audio {len(st.session_state.local_avatar_audio)}/{len(eligible_slides)} slide. Hãy nghe thử trước khi chạy nhép môi.")
+                    audio_slides = sorted(st.session_state.local_avatar_audio.keys())
+                    listen_slide = st.selectbox("Nghe thử audio", audio_slides, format_func=lambda n: f"Slide {n}", key="local_audio_review_slide")
+                    st.audio(st.session_state.local_avatar_audio[listen_slide], format="audio/wav")
+
+                if create_lipsync:
+                    missing_audio = [s for s in eligible_slides if s not in st.session_state.local_avatar_audio]
+                    if missing_audio:
+                        st.error(f"Chưa có audio cho slide: {missing_audio[:10]}")
+                    else:
+                        st.session_state.local_avatar_queue = [
+                            s for s in eligible_slides if s not in st.session_state.local_avatar_clips
+                        ]
+                        st.rerun()
+
+                if st.session_state.local_avatar_audio and not st.session_state.local_voice_queue and not st.session_state.local_avatar_queue:
+                    preview_slide = st.selectbox(
+                        "Slide để tạo thử nhép môi",
+                        sorted(st.session_state.local_avatar_audio.keys()),
+                        format_func=lambda n: f"Slide {n}", key="local_lipsync_preview_slide",
+                    )
+                    if st.button("Tạo thử nhép môi slide đang chọn", use_container_width=True):
+                        st.session_state.local_avatar_queue = [preview_slide]
+                        st.rerun()
 
                 queue = st.session_state.local_avatar_queue
                 if not st.session_state.local_voice_queue and queue:
                     current_slide = queue[0]
-                    st.progress((len(st.session_state.local_avatar_clips)) / max(1, len(st.session_state.local_avatar_audio)), text=f"OpenAvatar Runtime đang tạo avatar cho slide {current_slide}")
+                    st.progress(
+                        len(st.session_state.local_avatar_clips) / max(1, len(st.session_state.local_avatar_audio)),
+                        text=f"OpenAvatar đang nhép môi slide {current_slide}",
+                    )
                     result = local_gpu_bridge(
                         action="generate", agent_url=openavatar_runtime_url,
                         image_bytes=st.session_state.avatar_upload,
@@ -1026,14 +1035,11 @@ with tab_export:
                             st.rerun()
                     elif isinstance(result, dict) and result.get("ok") is False:
                         st.error(result.get("error", "OpenAvatar Runtime xử lý thất bại"))
-                elif (
-                    not st.session_state.local_voice_queue
-                    and st.session_state.local_avatar_audio
-                    and not st.session_state.local_avatar_queue
-                ):
-                    done = len(st.session_state.local_avatar_clips)
-                    total = len(st.session_state.local_avatar_audio)
-                    st.success(f"Đã tạo {done}/{total} clip avatar bằng OpenAvatar Runtime.")
+
+                if st.session_state.local_avatar_clips and not st.session_state.local_avatar_queue:
+                    st.success(f"Nhép môi sẵn sàng {len(st.session_state.local_avatar_clips)}/{len(eligible_slides)} slide.")
+                    clip_slide = st.selectbox("Xem thử clip nhép môi", sorted(st.session_state.local_avatar_clips.keys()), format_func=lambda n: f"Slide {n}", key="local_avatar_review_slide")
+                    st.video(st.session_state.local_avatar_clips[clip_slide])
 
         if st.button("Tạo video", type="primary", use_container_width=True):
             if voice_engine in {"uploaded", "voice_clone"} and not voice_upload_unlocked:

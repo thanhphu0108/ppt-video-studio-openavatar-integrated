@@ -155,12 +155,13 @@ async function execute(){
   }catch(e){ statusEl.className='err'; statusEl.textContent='Không gọi được dịch vụ local: '+e.message; value({ok:false,error:String(e.message||e),request_id:args.request_id}); }
   finally{runBtn.disabled=false;}
 }
-window.addEventListener('message',e=>{ const d=e.data||{}; if(d.type==='streamlit:render'){ args=d.args||{}; runBtn.style.display='inline-block'; runBtn.textContent =
+window.addEventListener('message',e=>{ const d=e.data||{}; if(d.type==='streamlit:render'){ args=d.args||{}; runBtn.style.display = args.action==='voice_synthesize' ? 'none' : 'inline-block';
+    runBtn.textContent =
       (args.action==='health' || args.action==='voice_health') ? 'Kiểm tra lại' :
-      args.action==='voice_synthesize' ? 'Tạo audio bằng F5-TTS local' :
-      'Tạo avatar bằng OpenAvatar Runtime'; runBtn.onclick=execute; if(args.action==='health') execute(); else statusEl.textContent =
-      args.action==='voice_synthesize'
-        ? 'Sẵn sàng gửi mẫu giọng và text tới Local Voice Clone trên máy này.'
-        : 'Sẵn sàng gửi dữ liệu tới OpenAvatar Runtime trên máy này.'; post('streamlit:setFrameHeight',{height:88}); }});
+      'Tạo avatar bằng OpenAvatar Runtime'; runBtn.onclick=execute; if(args.action==='health' || args.action==='voice_health' || args.action==='voice_synthesize') {
+      execute();
+    } else {
+      statusEl.textContent='Sẵn sàng gửi dữ liệu tới OpenAvatar Runtime trên máy này.';
+    } post('streamlit:setFrameHeight',{height:88}); }});
 ready();
 </script></body></html>

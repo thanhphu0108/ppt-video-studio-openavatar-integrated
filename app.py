@@ -81,7 +81,6 @@ def init_state() -> None:
         st.session_state.local_avatar_audio = {}
     if "local_avatar_queue" not in st.session_state:
         st.session_state.local_avatar_queue = []
-    st.session_state.local_voice_queue = []
     if "local_voice_queue" not in st.session_state:
         st.session_state.local_voice_queue = []
 

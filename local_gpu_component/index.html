@@ -73,10 +73,94 @@ async function execute(){
       });
       return;
     }
+
+    if(args.action==='voice_health'){
+      statusEl.textContent='Đang kiểm tra Local Voice Clone…';
+      const r=await fetch(base+'/health',{method:'GET'});
+      const payload=await r.json();
+      if(!r.ok) throw new Error(payload.detail||payload.message||('HTTP '+r.status));
+      statusEl.className='ok';
+      statusEl.textContent='✓ '+(payload.service||'Local Voice Clone')+' sẵn sàng';
+      value({ok:true,kind:'voice_health',payload,request_id:args.request_id});
+      return;
+    }
+
+    if(args.action==='voice_synthesize'){
+      statusEl.textContent='Đang tạo giọng bằng F5-TTS trên GPU local…';
+      if(!args.reference_audio_data_url) throw new Error('Thiếu mẫu giọng.');
+      if(!args.text) throw new Error('Thiếu nội dung cần đọc.');
+
+      const fd=new FormData();
+      fd.append('reference_audio',dataUrlToBlob(args.reference_audio_data_url),
+                args.reference_audio_filename||'reference.wav');
+      fd.append('text',args.text||'');
+      fd.append('voice_id',args.voice_id||'default');
+      fd.append('model',args.model||'f5-tts');
+      if(args.reference_text) fd.append('reference_text',args.reference_text);
+
+      const headers={};
+      if(args.api_key) headers['Authorization']='Bearer '+args.api_key;
+
+      const r=await fetch(base+'/v1/voice-clone/synthesize',{
+        method:'POST',headers,body:fd
+      });
+
+      if(!r.ok){
+        let detail='';
+        try{
+          const p=await r.json();
+          detail=p.message||p.detail||JSON.stringify(p);
+        }catch(_){ detail=await r.text(); }
+        throw new Error(detail||('HTTP '+r.status));
+      }
+
+      const ct=(r.headers.get('content-type')||'').toLowerCase();
+      if(ct.includes('audio/') || ct.includes('application/octet-stream')){
+        const buf=await r.arrayBuffer();
+        statusEl.className='ok';
+        statusEl.textContent='✓ Đã tạo audio bằng GPU local.';
+        value({ok:true,kind:'audio',audio_base64:arrayBufferToBase64(buf),
+               content_type:ct||'audio/wav',request_id:args.request_id});
+        return;
+      }
+
+      const payload=await r.json();
+      if(payload.audio_base64){
+        statusEl.className='ok';
+        statusEl.textContent='✓ Đã tạo audio bằng GPU local.';
+        value({ok:true,kind:'audio',audio_base64:payload.audio_base64,
+               content_type:payload.content_type||'audio/wav',
+               payload,request_id:args.request_id});
+        return;
+      }
+
+      if(payload.audio_url){
+        const audioUrl=new URL(payload.audio_url,base).toString();
+        statusEl.textContent='Đang tải audio từ Local Voice Clone…';
+        const ar=await fetch(audioUrl);
+        if(!ar.ok) throw new Error('Không tải được audio: HTTP '+ar.status);
+        const buf=await ar.arrayBuffer();
+        statusEl.className='ok';
+        statusEl.textContent='✓ Đã tạo audio bằng GPU local.';
+        value({ok:true,kind:'audio',audio_base64:arrayBufferToBase64(buf),
+               content_type:(ar.headers.get('content-type')||'audio/wav'),
+               payload,request_id:args.request_id});
+        return;
+      }
+
+      throw new Error('Voice Clone service không trả audio_base64 hoặc audio_url.');
+    }
+
     throw new Error('Action không hợp lệ.');
-  }catch(e){ statusEl.className='err'; statusEl.textContent='Không kết nối được OpenAvatar Runtime: '+e.message; value({ok:false,error:String(e.message||e),request_id:args.request_id}); }
+  }catch(e){ statusEl.className='err'; statusEl.textContent='Không gọi được dịch vụ local: '+e.message; value({ok:false,error:String(e.message||e),request_id:args.request_id}); }
   finally{runBtn.disabled=false;}
 }
-window.addEventListener('message',e=>{ const d=e.data||{}; if(d.type==='streamlit:render'){ args=d.args||{}; runBtn.style.display='inline-block'; runBtn.textContent=args.action==='health'?'Kiểm tra lại':'Tạo avatar bằng OpenAvatar Runtime'; runBtn.onclick=execute; if(args.action==='health') execute(); else statusEl.textContent='Sẵn sàng gửi dữ liệu tới OpenAvatar Runtime trên máy này.'; post('streamlit:setFrameHeight',{height:88}); }});
+window.addEventListener('message',e=>{ const d=e.data||{}; if(d.type==='streamlit:render'){ args=d.args||{}; runBtn.style.display='inline-block'; runBtn.textContent =
+      (args.action==='health' || args.action==='voice_health') ? 'Kiểm tra lại' :
+      args.action==='voice_synthesize' ? 'Tạo audio bằng F5-TTS local' :
+      'Tạo avatar bằng OpenAvatar Runtime'; runBtn.onclick=execute; if(args.action==='health') execute(); else statusEl.textContent =
+      args.action==='voice_synthesize'
+        ? 'Sẵn sàng gửi mẫu giọng và text tới Local Voice Clone trên máy này.'
+        : 'Sẵn sàng gửi dữ liệu tới OpenAvatar Runtime trên máy này.'; post('streamlit:setFrameHeight',{height:88}); }});
 ready();
 </script></body></html>

@@ -25,3 +25,31 @@ local_voice_clone/models/*
 !local_voice_clone/models/.gitkeep
 local_voice_clone/voices/default/reference.*
 local_voice_clone/voices/default/transcript.txt
+
+# ============================================================
+# Local Voice Clone - Runtime / Large Files
+# ============================================================
+
+# Python virtual environment
+local_voice_clone/.venv/
+
+# FFmpeg local runtime
+local_voice_clone/third_party/
+
+# F5-TTS / Vocos models
+local_voice_clone/models/
+
+# Generated audio
+local_voice_clone/generated_audio/
+
+# Python cache
+local_voice_clone/**/__pycache__/
+local_voice_clone/**/*.pyc
+
+# Local voice samples - optional/private
+local_voice_clone/voices/*/reference.wav
+local_voice_clone/voices/*/*.mp3
+
+# Logs / temp
+local_voice_clone/logs/
+local_voice_clone/tmp/

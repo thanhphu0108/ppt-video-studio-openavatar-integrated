@@ -15,7 +15,16 @@ from .base import EngineStatus, EngineUnavailableError, VoiceCloneEngine
 
 
 class F5TTSEngine(VoiceCloneEngine):
-    """Thin adapter cho official `f5_tts.api.F5TTS` API."""
+    """Production-local adapter for official ``f5_tts.api.F5TTS``.
+
+    Safety / runtime rules:
+    - Local-only by default: no implicit Hugging Face download.
+    - Requires an explicit reference transcript in offline mode.
+    - Uses local Vocos when available.
+    - Prefers explicit local F5 checkpoint/vocab when the installed API exposes
+      compatible constructor parameters.
+    - Normalizes generated WAV if peak level risks clipping.
+    """
 
     id = "f5-tts"
 
@@ -31,6 +40,21 @@ class F5TTSEngine(VoiceCloneEngine):
         self.model_name = model_name
         self.allow_model_download = allow_model_download
         self.model_cache_dir = Path(model_cache_dir).resolve() if model_cache_dir else None
+
+        root = Path(__file__).resolve().parents[1]
+        self.model_dir = Path(
+            os.getenv(
+                "F5_TTS_MODEL_DIR",
+                str(root / "models" / "F5-TTS" / "F5TTS_v1_Base"),
+            )
+        ).resolve()
+        self.vocoder_dir = Path(
+            os.getenv(
+                "F5_TTS_VOCODER_DIR",
+                str(root / "models" / "vocos-mel-24khz"),
+            )
+        ).resolve()
+
         self._model: Any | None = None
         self._error = ""
         self._resolved_device = device
@@ -38,17 +62,15 @@ class F5TTSEngine(VoiceCloneEngine):
     def _device(self) -> str:
         if self.requested_device != "auto":
             return self.requested_device
+
         try:
             import torch
-
             return "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             return "cpu"
 
     @staticmethod
     def _configure_utf8_console() -> None:
-        """Keep upstream F5 debug output from breaking on Windows code pages."""
-
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")
@@ -57,23 +79,24 @@ class F5TTSEngine(VoiceCloneEngine):
 
     @staticmethod
     def _enable_soundfile_wav_fallback() -> None:
-        """Avoid a TorchCodec/FFmpeg DLL issue for our already-normalized WAVs.
+        """Read normalized local WAV files with SoundFile.
 
-        F5-TTS currently calls ``torchaudio.load`` for the reference WAV.  On
-        some Windows CPU environments recent torchaudio delegates this to
-        TorchCodec, whose shared FFmpeg DLLs may not be loadable even when the
-        standalone FFmpeg executable is installed.  This narrow fallback only
-        handles local WAV paths that this service has already normalized; all
-        other inputs retain torchaudio's normal behaviour.
+        This is deliberately narrow. Non-WAV sources retain torchaudio's normal
+        loading path.
         """
-
         try:
             import torch
             import torchaudio
         except ImportError:
             return
-        if getattr(torchaudio.load, "_local_voice_clone_soundfile_fallback", False):
+
+        if getattr(
+            torchaudio.load,
+            "_local_voice_clone_soundfile_fallback",
+            False,
+        ):
             return
+
         original_load = torchaudio.load
 
         def load_wav_with_soundfile(
@@ -86,6 +109,7 @@ class F5TTSEngine(VoiceCloneEngine):
             **kwargs: Any,
         ) -> tuple[Any, int]:
             path = Path(uri) if isinstance(uri, (str, Path)) else None
+
             if path is None or path.suffix.lower() != ".wav":
                 return original_load(
                     uri,
@@ -96,46 +120,127 @@ class F5TTSEngine(VoiceCloneEngine):
                     *args,
                     **kwargs,
                 )
-            samples, sample_rate = sf.read(path, always_2d=True, dtype="float32")
+
+            samples, sample_rate = sf.read(
+                path,
+                always_2d=True,
+                dtype="float32",
+            )
+
             start = max(0, int(frame_offset))
-            end = None if num_frames is None or int(num_frames) < 0 else start + int(num_frames)
+            end = (
+                None
+                if num_frames is None or int(num_frames) < 0
+                else start + int(num_frames)
+            )
             samples = np.ascontiguousarray(samples[start:end])
-            tensor = torch.from_numpy(samples.T if channels_first else samples)
+
+            tensor = torch.from_numpy(
+                samples.T if channels_first else samples
+            )
             return tensor, int(sample_rate)
 
-        setattr(load_wav_with_soundfile, "_local_voice_clone_soundfile_fallback", True)
+        setattr(
+            load_wav_with_soundfile,
+            "_local_voice_clone_soundfile_fallback",
+            True,
+        )
         torchaudio.load = load_wav_with_soundfile
+
+    def _validate_local_assets(self) -> None:
+        if self.allow_model_download:
+            return
+
+        vocos_config = self.vocoder_dir / "config.yaml"
+        vocos_model = self.vocoder_dir / "pytorch_model.bin"
+
+        if not vocos_config.exists():
+            raise EngineUnavailableError(
+                f"Thiếu Vocos config local: {vocos_config}"
+            )
+        if not vocos_model.exists():
+            raise EngineUnavailableError(
+                f"Thiếu Vocos model local: {vocos_model}"
+            )
+
+        # F5 checkpoint is validated only when we intend to bind it explicitly.
+        # Some official F5 versions resolve the checkpoint from the HF cache
+        # using the model name even in offline mode.
+        local_ckpt = self.model_dir / "model_1250000.safetensors"
+        local_vocab = self.model_dir / "vocab.txt"
+
+        if not local_ckpt.exists():
+            raise EngineUnavailableError(
+                f"Thiếu F5-TTS checkpoint local: {local_ckpt}"
+            )
+        if not local_vocab.exists():
+            raise EngineUnavailableError(
+                f"Thiếu F5-TTS vocab local: {local_vocab}"
+            )
 
     def load(self) -> None:
         if self._model is not None:
             return
+
         self._resolved_device = self._device()
         self._configure_utf8_console()
         self._enable_soundfile_wav_fallback()
+
         if not self.allow_model_download:
-            # The upstream helper may otherwise fetch public checkpoints on
-            # first use.  The service must never initiate a network transfer
-            # of its own in local-only mode.
             os.environ["HF_HUB_OFFLINE"] = "1"
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
         try:
             from f5_tts.api import F5TTS
         except ImportError as exc:
-            self._error = "Chưa cài F5-TTS. Chạy `pip install -r requirements-f5.txt`."
+            self._error = (
+                "Chưa cài F5-TTS. "
+                "Chạy `pip install -r requirements-f5.txt`."
+            )
             raise EngineUnavailableError(self._error) from exc
 
         try:
+            self._validate_local_assets()
+
             signature = inspect.signature(F5TTS)
             kwargs: dict[str, Any] = {}
+
             if "model" in signature.parameters:
                 kwargs["model"] = self.model_name
+
             if "device" in signature.parameters:
                 kwargs["device"] = self._resolved_device
-            if "hf_cache_dir" in signature.parameters and self.model_cache_dir is not None:
-                self.model_cache_dir.mkdir(parents=True, exist_ok=True)
+
+            if (
+                "hf_cache_dir" in signature.parameters
+                and self.model_cache_dir is not None
+            ):
+                self.model_cache_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
                 kwargs["hf_cache_dir"] = str(self.model_cache_dir)
+
+            # Use local Vocos so synthesis never needs to fetch it.
+            if "vocoder_local_path" in signature.parameters:
+                kwargs["vocoder_local_path"] = str(self.vocoder_dir)
+
+            # Different F5-TTS releases expose different local checkpoint
+            # parameter names. Bind only when the installed API supports them.
+            ckpt = self.model_dir / "model_1250000.safetensors"
+            vocab = self.model_dir / "vocab.txt"
+
+            if "ckpt_file" in signature.parameters:
+                kwargs["ckpt_file"] = str(ckpt)
+            elif "ckpt_path" in signature.parameters:
+                kwargs["ckpt_path"] = str(ckpt)
+
+            if "vocab_file" in signature.parameters:
+                kwargs["vocab_file"] = str(vocab)
+
             self._model = F5TTS(**kwargs)
             self._error = ""
+
         except Exception as exc:
             self._error = f"Không tải được F5-TTS: {exc}"
             raise EngineUnavailableError(self._error) from exc
@@ -149,14 +254,15 @@ class F5TTSEngine(VoiceCloneEngine):
                 device=self._resolved_device,
                 model=self.model_name,
             )
+
         try:
             import f5_tts  # noqa: F401
-
             available = True
             message = self._error or "F5-TTS đã cài, chờ load model."
         except ImportError:
             available = False
             message = self._error or "Chưa cài F5-TTS."
+
         return EngineStatus(
             id=self.id,
             available=available,
@@ -165,6 +271,36 @@ class F5TTSEngine(VoiceCloneEngine):
             model=self.model_name,
             message=message,
         )
+
+    @staticmethod
+    def _normalize_if_clipping_risk(
+        path: Path,
+        target_peak: float = 0.891250938,  # -1 dBFS
+    ) -> None:
+        """Apply conservative peak normalization only when needed."""
+        audio, sr = sf.read(
+            path,
+            always_2d=False,
+            dtype="float32",
+        )
+
+        if audio.size == 0:
+            return
+
+        peak = float(np.max(np.abs(audio)))
+        if peak <= 0:
+            return
+
+        # Normalize only when the waveform is close to full scale.
+        if peak >= 0.98:
+            gain = target_peak / peak
+            audio = np.clip(audio * gain, -1.0, 1.0)
+            sf.write(
+                path,
+                audio,
+                sr,
+                subtype="PCM_16",
+            )
 
     def synthesize(
         self,
@@ -176,41 +312,61 @@ class F5TTSEngine(VoiceCloneEngine):
         speed: float = 1.0,
     ) -> str:
         self.load()
-        if self._model is None:  # defensive for type checker and failed loads
-            raise EngineUnavailableError(self._error or "F5-TTS chưa được load.")
+
+        if self._model is None:
+            raise EngineUnavailableError(
+                self._error or "F5-TTS chưa được load."
+            )
+
+        if not reference_text or not reference_text.strip():
+            raise EngineUnavailableError(
+                "Thiếu reference_text. Chế độ local/offline yêu cầu "
+                "transcript đúng với reference audio; không tự gọi ASR "
+                "hoặc Hugging Face."
+            )
+
         target = Path(output_path).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
+
         infer = self._model.infer
         signature = inspect.signature(infer)
+
         kwargs: dict[str, Any] = {
             "ref_file": str(Path(reference_audio).resolve()),
-            "ref_text": reference_text or "",
+            "ref_text": reference_text.strip(),
             "gen_text": text,
             "file_wave": str(target),
         }
+
         if "speed" in signature.parameters:
             kwargs["speed"] = speed
         if "language" in signature.parameters:
             kwargs["language"] = language
         if "show_info" in signature.parameters:
-            # Upstream emits ref/gen text through this callback.  On default
-            # Windows CP1252 consoles that can raise UnicodeEncodeError for
-            # Vietnamese before inference starts.  Request-level logging is
-            # handled by SynthesisService instead, without recording text.
             kwargs["show_info"] = lambda *_args, **_kwargs: None
+
         try:
-            # F5 currently prints reference and generated text internally,
-            # bypassing `show_info`.  Keep it out of process logs/terminals so
-            # LOG_FULL_TEXT=false genuinely protects narration/transcripts.
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 result = infer(**kwargs)
         except Exception as exc:
             self._error = f"F5-TTS inference lỗi: {exc}"
             raise
 
-        if not target.exists() and isinstance(result, tuple) and len(result) >= 2:
+        if (
+            not target.exists()
+            and isinstance(result, tuple)
+            and len(result) >= 2
+        ):
             wav, sample_rate = result[0], result[1]
-            sf.write(target, wav, sample_rate, subtype="PCM_16")
+            sf.write(
+                target,
+                wav,
+                sample_rate,
+                subtype="PCM_16",
+            )
+
         if not target.exists() or target.stat().st_size == 0:
             raise RuntimeError("F5-TTS không tạo được file WAV.")
+
+        self._normalize_if_clipping_risk(target)
         return str(target)

@@ -1,0 +1,9 @@
+{
+  "model": "f5-tts",
+  "voice_id": "default",
+  "text": "Xin chào, đây là bài kiểm tra clone giọng tiếng Việt.",
+  "reference_text": "THAY BẰNG ĐÚNG NỘI DUNG ĐƯỢC NÓI TRONG reference.wav",
+  "language": "vi",
+  "speed": 1.0,
+  "output_format": "wav"
+}

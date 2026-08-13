@@ -16,6 +16,55 @@ function post(type, data={}) { window.parent.postMessage({isStreamlitMessage:tru
 function ready(){ post('streamlit:componentReady',{apiVersion:1}); post('streamlit:setFrameHeight',{height:78}); }
 function value(v){ post('streamlit:setComponentValue',{value:v}); }
 function dataUrlToBlob(dataUrl){ const [head,b64]=dataUrl.split(','); const mime=(head.match(/data:(.*?);/)||[])[1]||'application/octet-stream'; const bin=atob(b64); const arr=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)arr[i]=bin.charCodeAt(i); return new Blob([arr],{type:mime}); }
+
+const CACHE_DB_NAME='ppt-video-local-runtime-cache';
+const CACHE_DB_VERSION=1;
+const CACHE_STORE='artifacts';
+
+function openCacheDb(){
+  return new Promise((resolve,reject)=>{
+    const req=indexedDB.open(CACHE_DB_NAME,CACHE_DB_VERSION);
+    req.onupgradeneeded=()=>{
+      const db=req.result;
+      if(!db.objectStoreNames.contains(CACHE_STORE)){
+        db.createObjectStore(CACHE_STORE,{keyPath:'key'});
+      }
+    };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error);
+  });
+}
+
+async function cacheGet(key){
+  if(!key || !('indexedDB' in window)) return null;
+  try{
+    const db=await openCacheDb();
+    return await new Promise((resolve,reject)=>{
+      const tx=db.transaction(CACHE_STORE,'readonly');
+      const req=tx.objectStore(CACHE_STORE).get(key);
+      req.onsuccess=()=>resolve(req.result||null);
+      req.onerror=()=>reject(req.error);
+    });
+  }catch(_){ return null; }
+}
+
+async function cachePut(key,kind,contentType,base64){
+  if(!key || !base64 || !('indexedDB' in window)) return false;
+  try{
+    const db=await openCacheDb();
+    await new Promise((resolve,reject)=>{
+      const tx=db.transaction(CACHE_STORE,'readwrite');
+      tx.objectStore(CACHE_STORE).put({
+        key,kind,content_type:contentType||'application/octet-stream',
+        base64,updated_at:Date.now()
+      });
+      tx.oncomplete=()=>resolve();
+      tx.onerror=()=>reject(tx.error);
+    });
+    return true;
+  }catch(_){ return false; }
+}
+
 function arrayBufferToBase64(buffer){ const bytes=new Uint8Array(buffer); let binary=''; const chunk=0x8000; for(let i=0;i<bytes.length;i+=chunk){binary+=String.fromCharCode.apply(null,bytes.subarray(i,Math.min(i+chunk,bytes.length)));} return btoa(binary); }
 async function execute(){
   runBtn.disabled=true; statusEl.className='muted';
@@ -29,6 +78,20 @@ async function execute(){
       value({ok:true,kind:'health',payload,request_id:args.request_id}); return;
     }
     if(args.action==='generate'){
+      if(args.cache_key){
+        const cached=await cacheGet('avatar:'+args.cache_key);
+        if(cached && cached.base64){
+          statusEl.className='ok';
+          statusEl.textContent='✓ Dùng clip nhép môi từ browser cache.';
+          value({
+            ok:true,kind:'video',video_base64:cached.base64,
+            content_type:cached.content_type||'video/mp4',
+            cache_hit:true,cache_source:'indexeddb',
+            request_id:args.request_id
+          });
+          return;
+        }
+      }
       statusEl.textContent='Đang gửi ảnh và audio tới OpenAvatar Runtime…';
       const fd=new FormData();
       fd.append('image',dataUrlToBlob(args.image_data_url),'avatar.png');
@@ -62,11 +125,15 @@ async function execute(){
       if(!download.ok){ let t=await download.text(); throw new Error(t||('HTTP '+download.status)); }
       const buf=await download.arrayBuffer();
       const ct=(download.headers.get('content-type')||'video/mp4').toLowerCase();
+      const videoB64=arrayBufferToBase64(buf);
+      if(args.cache_key){
+        await cachePut('avatar:'+args.cache_key,'video',ct,videoB64);
+      }
       statusEl.className='ok'; statusEl.textContent='✓ OpenAvatar Runtime đã tạo xong video avatar.';
       value({
         ok:true,
         kind:'video',
-        video_base64:arrayBufferToBase64(buf),
+        video_base64:videoB64,
         content_type:ct,
         job_id:job.id,
         request_id:args.request_id
@@ -86,6 +153,20 @@ async function execute(){
     }
 
     if(args.action==='voice_synthesize'){
+      if(args.cache_key){
+        const cached=await cacheGet('audio:'+args.cache_key);
+        if(cached && cached.base64){
+          statusEl.className='ok';
+          statusEl.textContent='✓ Dùng audio từ browser cache.';
+          value({
+            ok:true,kind:'audio',audio_base64:cached.base64,
+            content_type:cached.content_type||'audio/wav',
+            cache_hit:true,cache_source:'indexeddb',
+            request_id:args.request_id
+          });
+          return;
+        }
+      }
       statusEl.textContent='Đang tạo giọng bằng F5-TTS trên GPU local…';
       if(!args.reference_audio_data_url) throw new Error('Thiếu mẫu giọng.');
       if(!args.text) throw new Error('Thiếu nội dung cần đọc.');
@@ -124,15 +205,25 @@ async function execute(){
       const ct=(r.headers.get('content-type')||'').toLowerCase();
       if(ct.includes('audio/') || ct.includes('application/octet-stream')){
         const buf=await r.arrayBuffer();
+        const audioB64=arrayBufferToBase64(buf);
+        if(args.cache_key){
+          await cachePut('audio:'+args.cache_key,'audio',ct||'audio/wav',audioB64);
+        }
         statusEl.className='ok';
         statusEl.textContent='✓ Đã tạo audio bằng GPU local.';
-        value({ok:true,kind:'audio',audio_base64:arrayBufferToBase64(buf),
+        value({ok:true,kind:'audio',audio_base64:audioB64,
                content_type:ct||'audio/wav',request_id:args.request_id});
         return;
       }
 
       const payload=await r.json();
       if(payload.audio_base64){
+        if(args.cache_key){
+          await cachePut(
+            'audio:'+args.cache_key,'audio',
+            payload.content_type||'audio/wav',payload.audio_base64
+          );
+        }
         statusEl.className='ok';
         statusEl.textContent='✓ Đã tạo audio bằng GPU local.';
         value({ok:true,kind:'audio',audio_base64:payload.audio_base64,
@@ -147,10 +238,15 @@ async function execute(){
         const ar=await fetch(audioUrl);
         if(!ar.ok) throw new Error('Không tải được audio: HTTP '+ar.status);
         const buf=await ar.arrayBuffer();
+        const audioB64=arrayBufferToBase64(buf);
+        const audioCt=(ar.headers.get('content-type')||'audio/wav');
+        if(args.cache_key){
+          await cachePut('audio:'+args.cache_key,'audio',audioCt,audioB64);
+        }
         statusEl.className='ok';
         statusEl.textContent='✓ Đã tạo audio bằng GPU local.';
-        value({ok:true,kind:'audio',audio_base64:arrayBufferToBase64(buf),
-               content_type:(ar.headers.get('content-type')||'audio/wav'),
+        value({ok:true,kind:'audio',audio_base64:audioB64,
+               content_type:audioCt,
                payload,request_id:args.request_id});
         return;
       }

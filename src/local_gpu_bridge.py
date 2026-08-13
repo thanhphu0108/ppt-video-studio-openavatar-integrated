@@ -52,6 +52,7 @@ def local_gpu_bridge(
     engine: str = "wav2lip",
     preview_seconds: float | None = None,
     request_id: str = "default",
+    cache_key: str = "",
     key: str | None = None,
 ) -> Any:
     """Browser bridge for OpenAvatar (8008) and Local Voice Clone (8009)."""
@@ -75,6 +76,7 @@ def local_gpu_bridge(
         engine=engine,
         preview_seconds=preview_seconds,
         request_id=request_id,
+        cache_key=cache_key,
         key=key,
         default=None,
     )

@@ -5,6 +5,8 @@ import os
 import json
 import re
 import tempfile
+import hashlib
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -41,6 +43,10 @@ except ImportError:
     OpenAvatarClient = None
 
 ROOT = Path(__file__).parent
+LOCAL_PIPELINE_CACHE_DIR = ROOT / ".local_pipeline_cache"
+LOCAL_AUDIO_CACHE_DIR = LOCAL_PIPELINE_CACHE_DIR / "audio"
+LOCAL_AVATAR_CACHE_DIR = LOCAL_PIPELINE_CACHE_DIR / "avatar"
+LOCAL_PIPELINE_MANIFEST = LOCAL_PIPELINE_CACHE_DIR / "manifest.json"
 DEFAULT_DICTIONARY = ROOT / "config" / "pronunciation_default.json"
 PROFANITY_CONFIG = ROOT / "config" / "profanity_vi.json"
 
@@ -83,6 +89,18 @@ def init_state() -> None:
         st.session_state.local_avatar_queue = []
     if "local_voice_queue" not in st.session_state:
         st.session_state.local_voice_queue = []
+    if "local_job_status" not in st.session_state:
+        st.session_state.local_job_status = {}
+    if "local_job_stage" not in st.session_state:
+        st.session_state.local_job_stage = {}
+    if "local_job_errors" not in st.session_state:
+        st.session_state.local_job_errors = {}
+    if "local_job_failed_stage" not in st.session_state:
+        st.session_state.local_job_failed_stage = {}
+    if "local_job_cache_source" not in st.session_state:
+        st.session_state.local_job_cache_source = {}
+    if "local_continue_avatar_targets" not in st.session_state:
+        st.session_state.local_continue_avatar_targets = []
 
 
 init_state()
@@ -161,6 +179,13 @@ def reset_presentation_editing_state() -> None:
     st.session_state.local_avatar_clips = {}
     st.session_state.local_avatar_audio = {}
     st.session_state.local_avatar_queue = []
+    st.session_state.local_voice_queue = []
+    st.session_state.local_job_status = {}
+    st.session_state.local_job_stage = {}
+    st.session_state.local_job_errors = {}
+    st.session_state.local_job_failed_stage = {}
+    st.session_state.local_job_cache_source = {}
+    st.session_state.local_continue_avatar_targets = []
 
 
 def configured_voice_upload_password() -> str | None:
@@ -276,6 +301,209 @@ def scene_label(scene: VideoScene) -> str:
     if scene.slide_number:
         return f"slide {scene.slide_number}"
     return scene.title
+
+
+def _ensure_pipeline_cache_dirs() -> None:
+    LOCAL_AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    LOCAL_AVATAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_pipeline_manifest() -> dict:
+    _ensure_pipeline_cache_dirs()
+    if not LOCAL_PIPELINE_MANIFEST.exists():
+        return {"version": 1, "audio": {}, "avatar": {}}
+    try:
+        data = json.loads(LOCAL_PIPELINE_MANIFEST.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("manifest invalid")
+        data.setdefault("version", 1)
+        data.setdefault("audio", {})
+        data.setdefault("avatar", {})
+        return data
+    except Exception:
+        return {"version": 1, "audio": {}, "avatar": {}}
+
+
+def _save_pipeline_manifest(manifest: dict) -> None:
+    _ensure_pipeline_cache_dirs()
+    tmp = LOCAL_PIPELINE_MANIFEST.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp.replace(LOCAL_PIPELINE_MANIFEST)
+
+
+def _cache_audio_path(cache_key: str) -> Path:
+    return LOCAL_AUDIO_CACHE_DIR / f"{cache_key}.wav"
+
+
+def _cache_avatar_path(cache_key: str) -> Path:
+    return LOCAL_AVATAR_CACHE_DIR / f"{cache_key}.mp4"
+
+
+def _restore_audio_from_disk(slide: int, cache_key: str) -> bool:
+    path = _cache_audio_path(cache_key)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    st.session_state.local_avatar_audio[slide] = path.read_bytes()
+    st.session_state.local_audio_hashes[slide] = cache_key
+    return True
+
+
+def _restore_avatar_from_disk(slide: int, cache_key: str) -> bool:
+    path = _cache_avatar_path(cache_key)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    st.session_state.local_avatar_clips[slide] = path.read_bytes()
+    st.session_state.local_avatar_hashes[slide] = cache_key
+    return True
+
+
+def _persist_audio_cache(slide: int, cache_key: str, audio_bytes: bytes) -> None:
+    _ensure_pipeline_cache_dirs()
+    path = _cache_audio_path(cache_key)
+    path.write_bytes(audio_bytes)
+    manifest = _load_pipeline_manifest()
+    manifest["audio"][str(slide)] = {
+        "hash": cache_key,
+        "path": path.name,
+        "size": len(audio_bytes),
+        "updated_at": time.time(),
+    }
+    _save_pipeline_manifest(manifest)
+
+
+def _persist_avatar_cache(slide: int, cache_key: str, video_bytes: bytes) -> None:
+    _ensure_pipeline_cache_dirs()
+    path = _cache_avatar_path(cache_key)
+    path.write_bytes(video_bytes)
+    manifest = _load_pipeline_manifest()
+    manifest["avatar"][str(slide)] = {
+        "hash": cache_key,
+        "path": path.name,
+        "size": len(video_bytes),
+        "updated_at": time.time(),
+    }
+    _save_pipeline_manifest(manifest)
+
+
+def _clear_pipeline_disk_cache() -> tuple[int, int]:
+    _ensure_pipeline_cache_dirs()
+    audio_count = 0
+    avatar_count = 0
+    for path in LOCAL_AUDIO_CACHE_DIR.glob("*.wav"):
+        try:
+            path.unlink()
+            audio_count += 1
+        except OSError:
+            pass
+    for path in LOCAL_AVATAR_CACHE_DIR.glob("*.mp4"):
+        try:
+            path.unlink()
+            avatar_count += 1
+        except OSError:
+            pass
+    try:
+        LOCAL_PIPELINE_MANIFEST.unlink()
+    except FileNotFoundError:
+        pass
+    return audio_count, avatar_count
+
+
+def _pipeline_sha256(data: bytes | None) -> str:
+    return hashlib.sha256(data or b"").hexdigest()
+
+
+def _audio_job_cache_key(
+    rec: dict,
+    voice_clone_config: VoiceCloneConfig | None,
+    voice_engine: str,
+    voice_id: str,
+    voice_rate: str,
+) -> str:
+    narration = apply_dictionary(rec.get("narration", ""), st.session_state.dictionary)
+    payload = {
+        "slide": int(rec.get("slide") or 0),
+        "narration": narration,
+        "voice_engine": voice_engine,
+        "voice_id": voice_id,
+        "voice_rate": voice_rate,
+        "model": voice_clone_config.model if voice_clone_config else "",
+        "reference_text": voice_clone_config.reference_transcript if voice_clone_config else "",
+        "reference_audio_sha256": _pipeline_sha256(
+            voice_clone_config.reference_audio if voice_clone_config else b""
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _avatar_job_cache_key(
+    slide: int,
+    audio_bytes: bytes,
+    avatar_bytes: bytes | None,
+    engine: str,
+) -> str:
+    payload = {
+        "slide": int(slide),
+        "audio_sha256": _pipeline_sha256(audio_bytes),
+        "avatar_sha256": _pipeline_sha256(avatar_bytes),
+        "engine": engine,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _set_local_job(
+    slide: int,
+    status: str,
+    stage: str,
+    *,
+    error: str = "",
+    cache_source: str = "",
+) -> None:
+    st.session_state.local_job_status[slide] = status
+    st.session_state.local_job_stage[slide] = stage
+    if error:
+        st.session_state.local_job_errors[slide] = error
+    else:
+        st.session_state.local_job_errors.pop(slide, None)
+    if cache_source:
+        st.session_state.local_job_cache_source[slide] = cache_source
+
+
+def _job_dashboard_frame(eligible_slides: list[int]) -> pd.DataFrame:
+    rows = []
+    for slide in eligible_slides:
+        status = st.session_state.local_job_status.get(slide, "Pending")
+        stage = st.session_state.local_job_stage.get(slide, "Chưa bắt đầu")
+        cache_source = st.session_state.local_job_cache_source.get(slide, "")
+        error = st.session_state.local_job_errors.get(slide, "")
+        rows.append(
+            {
+                "Slide": slide,
+                "Status": status,
+                "Stage": stage,
+                "Audio": "✓" if slide in st.session_state.local_avatar_audio else "—",
+                "Lip-sync": "✓" if slide in st.session_state.local_avatar_clips else "—",
+                "Cache": cache_source,
+                "Error": error,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _queue_unique(items: list[int]) -> list[int]:
+    seen: set[int] = set()
+    result: list[int] = []
+    for item in items:
+        if item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result
 
 st.title("🎬 PPT Video Studio")
 st.caption("Chuyển PowerPoint thành video thuyết minh tiếng Việt; hỗ trợ OpenAvatar Runtime để nhép môi bằng GPU local khi app chạy trên Streamlit Cloud.")
@@ -889,157 +1117,379 @@ with tab_export:
             if avatar_image is None:
                 st.warning("Hãy tải ảnh người dẫn để dùng OpenAvatar Runtime.")
             else:
-                st.markdown("#### Quy trình Local AI")
-                st.caption("Tạo audio trước để nghe kiểm tra. Khi giọng đã ổn mới chạy nhép môi. Các bước GPU chạy tuần tự để tránh tranh VRAM.")
+                st.markdown("#### Resume Job Dashboard")
+                st.caption(
+                    "Mỗi slide có trạng thái Pending / Processing / Cached / Done / Failed. "
+                    "Job chạy tuần tự: F5-TTS trước, OpenAvatar sau để tránh tranh VRAM."
+                )
 
                 eligible_slides = [
                     rec["slide"] for rec in records
                     if not rec.get("skip") and rec.get("narration", "").strip()
                 ]
 
-                status_rows = []
+                # Synchronize dashboard with artifacts already present in session.
                 for slide in eligible_slides:
-                    status_rows.append({
-                        "Slide": slide,
-                        "Audio": "✓ Sẵn sàng" if slide in st.session_state.local_avatar_audio else "Chưa tạo",
-                        "Nhép môi": "✓ Sẵn sàng" if slide in st.session_state.local_avatar_clips else "Chưa tạo",
-                    })
-                if status_rows:
-                    st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+                    if slide in st.session_state.local_avatar_clips:
+                        if st.session_state.local_job_status.get(slide) not in {"Cached", "Failed"}:
+                            _set_local_job(slide, "Done", "Complete")
+                    elif slide in st.session_state.local_avatar_audio:
+                        if st.session_state.local_job_status.get(slide) not in {"Cached", "Failed", "Processing"}:
+                            _set_local_job(slide, "Done", "Audio ready")
+                    else:
+                        st.session_state.local_job_status.setdefault(slide, "Pending")
+                        st.session_state.local_job_stage.setdefault(slide, "Audio")
 
-                c_audio, c_lipsync = st.columns(2)
-                create_audio = c_audio.button("1. Tạo audio để nghe thử", use_container_width=True)
-                create_lipsync = c_lipsync.button(
-                    "2. Tạo nhép môi cho tất cả slide",
+                dashboard = _job_dashboard_frame(eligible_slides)
+                if not dashboard.empty:
+                    counts = dashboard["Status"].value_counts().to_dict()
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Cached", counts.get("Cached", 0))
+                    m2.metric("Pending", counts.get("Pending", 0))
+                    m3.metric("Processing", counts.get("Processing", 0))
+                    m4.metric("Done", counts.get("Done", 0))
+                    m5.metric("Failed", counts.get("Failed", 0))
+                    st.dataframe(
+                        dashboard,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Error": st.column_config.TextColumn(width="large"),
+                        },
+                    )
+
+                # Controls
+                ctl1, ctl2, ctl3 = st.columns([1, 1, 2])
+                retry_failed = ctl1.button(
+                    "Retry failed only",
+                    use_container_width=True,
+                    disabled=not bool(st.session_state.local_job_failed_stage),
+                )
+
+                min_slide = min(eligible_slides) if eligible_slides else 1
+                max_slide = max(eligible_slides) if eligible_slides else 1
+                continue_from = ctl2.number_input(
+                    "Continue from slide N",
+                    min_value=min_slide,
+                    max_value=max_slide,
+                    value=min_slide,
+                    step=1,
+                    key="resume_continue_from_slide",
+                )
+                continue_clicked = ctl2.button(
+                    "Continue",
+                    use_container_width=True,
+                    disabled=not bool(eligible_slides),
+                )
+
+                with ctl3:
+                    st.caption(
+                        "Retry failed only chỉ chạy lại slide lỗi. "
+                        "Continue from slide N tiếp tục pipeline từ slide N trở đi, "
+                        "tận dụng Browser IndexedDB cache nếu hash không đổi."
+                    )
+
+                # Normal workflow controls.
+                a1, a2, a3 = st.columns(3)
+                create_audio = a1.button(
+                    "1. Tạo / cập nhật audio",
+                    use_container_width=True,
+                )
+                preview_one = a2.button(
+                    "2. Preview nhép môi 1 slide",
+                    use_container_width=True,
+                    disabled=not bool(st.session_state.local_avatar_audio),
+                )
+                create_lipsync = a3.button(
+                    "3. Tạo / cập nhật nhép môi",
                     use_container_width=True,
                     disabled=not bool(st.session_state.local_avatar_audio),
                 )
 
+                # Retry only failed jobs.
+                if retry_failed:
+                    failed_audio = []
+                    failed_avatar = []
+                    for slide, stage in list(st.session_state.local_job_failed_stage.items()):
+                        if slide not in eligible_slides:
+                            continue
+                        if stage == "audio":
+                            failed_audio.append(slide)
+                        elif stage == "avatar":
+                            failed_avatar.append(slide)
+                        st.session_state.local_job_errors.pop(slide, None)
+                        _set_local_job(slide, "Pending", "Audio" if stage == "audio" else "Lip-sync")
+
+                    st.session_state.local_voice_queue = _queue_unique(failed_audio)
+                    st.session_state.local_avatar_queue = _queue_unique(
+                        [s for s in failed_avatar if s in st.session_state.local_avatar_audio]
+                    )
+                    for slide in failed_audio + failed_avatar:
+                        st.session_state.local_job_failed_stage.pop(slide, None)
+                    st.rerun()
+
+                # Resume from slide N and automatically continue to lip-sync after audio.
+                if continue_clicked:
+                    targets = [s for s in eligible_slides if s >= int(continue_from)]
+                    audio_pending = [s for s in targets if s not in st.session_state.local_avatar_audio]
+                    st.session_state.local_continue_avatar_targets = targets
+                    st.session_state.local_voice_queue = _queue_unique(audio_pending)
+
+                    for slide in targets:
+                        if slide in audio_pending:
+                            _set_local_job(slide, "Pending", "Audio")
+                        elif slide not in st.session_state.local_avatar_clips:
+                            _set_local_job(slide, "Pending", "Lip-sync")
+
+                    # No audio work needed: resume avatar immediately.
+                    if not st.session_state.local_voice_queue:
+                        st.session_state.local_avatar_queue = _queue_unique(
+                            [
+                                s for s in targets
+                                if s in st.session_state.local_avatar_audio
+                                and s not in st.session_state.local_avatar_clips
+                            ]
+                        )
+                        st.session_state.local_continue_avatar_targets = []
+                    st.rerun()
+
                 if create_audio:
-                    try:
-                        st.session_state.local_avatar_audio = {}
-                        st.session_state.local_avatar_clips = {}
-                        st.session_state.local_avatar_queue = []
-                        st.session_state.local_voice_queue = []
-
-                        if voice_engine == "voice_clone":
-                            if voice_clone_config is None:
-                                raise RuntimeError("Chưa cấu hình Voice Clone.")
-                            st.session_state.local_voice_queue = eligible_slides
-                        else:
-                            prep_dir = Path(tempfile.mkdtemp(prefix="local_avatar_audio_"))
-                            for rec in records:
-                                if rec.get("skip") or not rec.get("narration", "").strip():
-                                    continue
-                                audio_path = prep_dir / f"slide_{rec['slide']:03}.mp3"
-                                text_value = apply_dictionary(rec["narration"], st.session_state.dictionary)
-                                source_scene = VideoScene(
-                                    title=rec["title"], narration=text_value,
-                                    source_slide_number=rec["slide"],
-                                )
-                                prepared_audio = synthesize_scene_audio(
-                                    source_scene, audio_path,
-                                    voice_engine=voice_engine, voice_id=voice_id,
-                                    voice_rate=voice_rate,
-                                    voice_clone_config=voice_clone_config,
-                                    uploaded_audio=audio_asset_for_scene(source_scene, recorded_voice_assets),
-                                )
-                                if prepared_audio and prepared_audio.exists():
-                                    st.session_state.local_avatar_audio[rec["slide"]] = prepared_audio.read_bytes()
+                    if voice_engine == "voice_clone" and voice_clone_config is None:
+                        st.error("Chưa cấu hình Voice Clone.")
+                    else:
+                        pending = []
+                        for slide in eligible_slides:
+                            # Existing artifacts are retained; browser cache can refill missing ones.
+                            if slide not in st.session_state.local_avatar_audio:
+                                pending.append(slide)
+                                _set_local_job(slide, "Pending", "Audio")
+                        st.session_state.local_voice_queue = _queue_unique(pending)
                         st.rerun()
-                    except Exception as exc:
-                        st.error(f"Không tạo được audio: {exc}")
 
+                # Audio generation queue.
                 voice_queue = st.session_state.local_voice_queue
                 if voice_queue:
                     current_slide = voice_queue[0]
-                    current_rec = next((rec for rec in records if rec["slide"] == current_slide), None)
+                    current_rec = next(
+                        (rec for rec in records if rec["slide"] == current_slide),
+                        None,
+                    )
                     if current_rec is None:
                         st.session_state.local_voice_queue = voice_queue[1:]
                         st.rerun()
 
+                    _set_local_job(current_slide, "Processing", "Audio")
+
                     clone_endpoint = voice_clone_config.endpoint.rstrip("/")
                     marker = "/v1/voice-clone/synthesize"
-                    voice_base_url = clone_endpoint[:-len(marker)] if clone_endpoint.endswith(marker) else clone_endpoint
+                    voice_base_url = (
+                        clone_endpoint[:-len(marker)]
+                        if clone_endpoint.endswith(marker)
+                        else clone_endpoint
+                    )
 
-                    done_count = len(st.session_state.local_avatar_audio)
-                    total_count = done_count + len(voice_queue)
-                    st.progress(done_count / max(1, total_count), text=f"F5-TTS: slide {current_slide} ({done_count + 1}/{total_count})")
+                    total = len(voice_queue) + sum(
+                        1 for s in eligible_slides if s in st.session_state.local_avatar_audio
+                    )
+                    done = sum(
+                        1 for s in eligible_slides if s in st.session_state.local_avatar_audio
+                    )
+                    st.progress(
+                        done / max(1, total),
+                        text=f"F5-TTS: slide {current_slide}",
+                    )
 
+                    audio_cache_key = _audio_job_cache_key(
+                        current_rec,
+                        voice_clone_config,
+                        voice_engine,
+                        voice_id,
+                        voice_rate,
+                    )
                     voice_result = local_gpu_bridge(
-                        action="voice_synthesize", agent_url=voice_base_url,
+                        action="voice_synthesize",
+                        agent_url=voice_base_url,
                         reference_audio_bytes=voice_clone_config.reference_audio,
                         reference_audio_filename=voice_clone_config.reference_filename,
-                        text=apply_dictionary(current_rec["narration"], st.session_state.dictionary),
+                        text=apply_dictionary(
+                            current_rec["narration"],
+                            st.session_state.dictionary,
+                        ),
                         reference_text=voice_clone_config.reference_transcript or "",
-                        voice_id="default", model=voice_clone_config.model or "f5-tts",
+                        voice_id="default",
+                        model=voice_clone_config.model or "f5-tts",
                         api_key=voice_clone_config.api_key or "",
                         voice_use_consent=bool(voice_clone_config.voice_use_consent),
                         upload_password=voice_clone_config.upload_password or "",
-                        request_id=f"voice-slide-{current_slide}", key=f"voice_clone_{current_slide}",
+                        request_id=f"voice-slide-{current_slide}",
+                        cache_key=audio_cache_key,
+                        key=f"voice_clone_{current_slide}",
                     )
-                    if isinstance(voice_result, dict) and voice_result.get("ok") and voice_result.get("request_id") == f"voice-slide-{current_slide}":
+
+                    if (
+                        isinstance(voice_result, dict)
+                        and voice_result.get("ok")
+                        and voice_result.get("request_id") == f"voice-slide-{current_slide}"
+                    ):
                         audio_bytes = decode_audio_result(voice_result)
                         if audio_bytes:
                             st.session_state.local_avatar_audio[current_slide] = audio_bytes
+                            if voice_result.get("cache_hit"):
+                                _set_local_job(
+                                    current_slide,
+                                    "Cached",
+                                    "Audio ready",
+                                    cache_source=voice_result.get("cache_source", "cache"),
+                                )
+                            else:
+                                _set_local_job(current_slide, "Done", "Audio ready")
+                            st.session_state.local_job_failed_stage.pop(current_slide, None)
                             st.session_state.local_voice_queue = voice_queue[1:]
+
+                            # Continue-from-N: when last audio finishes, arm avatar queue.
+                            if (
+                                not st.session_state.local_voice_queue
+                                and st.session_state.local_continue_avatar_targets
+                            ):
+                                targets = list(st.session_state.local_continue_avatar_targets)
+                                st.session_state.local_avatar_queue = _queue_unique(
+                                    [
+                                        s for s in targets
+                                        if s in st.session_state.local_avatar_audio
+                                        and s not in st.session_state.local_avatar_clips
+                                    ]
+                                )
+                                st.session_state.local_continue_avatar_targets = []
                             st.rerun()
                     elif isinstance(voice_result, dict) and voice_result.get("ok") is False:
-                        st.error(voice_result.get("error", "Local Voice Clone xử lý thất bại"))
+                        message = voice_result.get("error", "Local Voice Clone xử lý thất bại")
+                        _set_local_job(current_slide, "Failed", "Audio", error=message)
+                        st.session_state.local_job_failed_stage[current_slide] = "audio"
+                        # Pop failed item so the batch can continue.
+                        st.session_state.local_voice_queue = voice_queue[1:]
+                        st.rerun()
 
+                # Audio review.
                 if st.session_state.local_avatar_audio and not st.session_state.local_voice_queue:
-                    st.success(f"Đã tạo audio {len(st.session_state.local_avatar_audio)}/{len(eligible_slides)} slide. Hãy nghe thử trước khi chạy nhép môi.")
-                    audio_slides = sorted(st.session_state.local_avatar_audio.keys())
-                    listen_slide = st.selectbox("Nghe thử audio", audio_slides, format_func=lambda n: f"Slide {n}", key="local_audio_review_slide")
-                    st.audio(st.session_state.local_avatar_audio[listen_slide], format="audio/wav")
+                    audio_slides = sorted(
+                        s for s in st.session_state.local_avatar_audio.keys()
+                        if s in eligible_slides
+                    )
+                    if audio_slides:
+                        listen_slide = st.selectbox(
+                            "Nghe thử audio",
+                            audio_slides,
+                            format_func=lambda n: f"Slide {n}",
+                            key="local_audio_review_slide",
+                        )
+                        st.audio(
+                            st.session_state.local_avatar_audio[listen_slide],
+                            format="audio/wav",
+                        )
+
+                if preview_one and st.session_state.local_avatar_audio:
+                    preview_slide = int(
+                        st.session_state.get(
+                            "local_audio_review_slide",
+                            sorted(st.session_state.local_avatar_audio.keys())[0],
+                        )
+                    )
+                    st.session_state.local_avatar_queue = [preview_slide]
+                    _set_local_job(preview_slide, "Pending", "Lip-sync")
+                    st.rerun()
 
                 if create_lipsync:
-                    missing_audio = [s for s in eligible_slides if s not in st.session_state.local_avatar_audio]
+                    missing_audio = [
+                        s for s in eligible_slides
+                        if s not in st.session_state.local_avatar_audio
+                    ]
                     if missing_audio:
-                        st.error(f"Chưa có audio cho slide: {missing_audio[:10]}")
+                        st.error(
+                            "Chưa có audio cho slide: "
+                            + ", ".join(map(str, missing_audio[:12]))
+                        )
                     else:
-                        st.session_state.local_avatar_queue = [
-                            s for s in eligible_slides if s not in st.session_state.local_avatar_clips
+                        targets = [
+                            s for s in eligible_slides
+                            if s not in st.session_state.local_avatar_clips
                         ]
+                        st.session_state.local_avatar_queue = _queue_unique(targets)
+                        for slide in targets:
+                            _set_local_job(slide, "Pending", "Lip-sync")
                         st.rerun()
 
-                if st.session_state.local_avatar_audio and not st.session_state.local_voice_queue and not st.session_state.local_avatar_queue:
-                    preview_slide = st.selectbox(
-                        "Slide để tạo thử nhép môi",
-                        sorted(st.session_state.local_avatar_audio.keys()),
-                        format_func=lambda n: f"Slide {n}", key="local_lipsync_preview_slide",
-                    )
-                    if st.button("Tạo thử nhép môi slide đang chọn", use_container_width=True):
-                        st.session_state.local_avatar_queue = [preview_slide]
-                        st.rerun()
-
+                # Lip-sync queue.
                 queue = st.session_state.local_avatar_queue
                 if not st.session_state.local_voice_queue and queue:
                     current_slide = queue[0]
-                    st.progress(
-                        len(st.session_state.local_avatar_clips) / max(1, len(st.session_state.local_avatar_audio)),
-                        text=f"OpenAvatar đang nhép môi slide {current_slide}",
+                    audio_bytes = st.session_state.local_avatar_audio.get(current_slide)
+                    if not audio_bytes:
+                        message = "Thiếu audio để chạy OpenAvatar."
+                        _set_local_job(current_slide, "Failed", "Lip-sync", error=message)
+                        st.session_state.local_job_failed_stage[current_slide] = "avatar"
+                        st.session_state.local_avatar_queue = queue[1:]
+                        st.rerun()
+
+                    _set_local_job(current_slide, "Processing", "Lip-sync")
+
+                    avatar_cache_key = _avatar_job_cache_key(
+                        current_slide,
+                        audio_bytes,
+                        st.session_state.avatar_upload,
+                        avatar_engine,
                     )
                     result = local_gpu_bridge(
-                        action="generate", agent_url=openavatar_runtime_url,
+                        action="generate",
+                        agent_url=openavatar_runtime_url,
                         image_bytes=st.session_state.avatar_upload,
-                        audio_bytes=st.session_state.local_avatar_audio[current_slide],
-                        engine=avatar_engine, request_id=f"slide-{current_slide}",
+                        audio_bytes=audio_bytes,
+                        engine=avatar_engine,
+                        request_id=f"slide-{current_slide}",
+                        cache_key=avatar_cache_key,
                         key=f"openavatar_generate_{current_slide}",
                     )
-                    if isinstance(result, dict) and result.get("ok") and result.get("request_id") == f"slide-{current_slide}":
+
+                    if (
+                        isinstance(result, dict)
+                        and result.get("ok")
+                        and result.get("request_id") == f"slide-{current_slide}"
+                    ):
                         clip = decode_video_result(result)
                         if clip:
                             st.session_state.local_avatar_clips[current_slide] = clip
+                            if result.get("cache_hit"):
+                                _set_local_job(
+                                    current_slide,
+                                    "Cached",
+                                    "Complete",
+                                    cache_source=result.get("cache_source", "cache"),
+                                )
+                            else:
+                                _set_local_job(current_slide, "Done", "Complete")
+                            st.session_state.local_job_failed_stage.pop(current_slide, None)
                             st.session_state.local_avatar_queue = queue[1:]
                             st.rerun()
                     elif isinstance(result, dict) and result.get("ok") is False:
-                        st.error(result.get("error", "OpenAvatar Runtime xử lý thất bại"))
+                        message = result.get("error", "OpenAvatar Runtime xử lý thất bại")
+                        _set_local_job(current_slide, "Failed", "Lip-sync", error=message)
+                        st.session_state.local_job_failed_stage[current_slide] = "avatar"
+                        st.session_state.local_avatar_queue = queue[1:]
+                        st.rerun()
 
+                # Clip review.
                 if st.session_state.local_avatar_clips and not st.session_state.local_avatar_queue:
-                    st.success(f"Nhép môi sẵn sàng {len(st.session_state.local_avatar_clips)}/{len(eligible_slides)} slide.")
-                    clip_slide = st.selectbox("Xem thử clip nhép môi", sorted(st.session_state.local_avatar_clips.keys()), format_func=lambda n: f"Slide {n}", key="local_avatar_review_slide")
-                    st.video(st.session_state.local_avatar_clips[clip_slide])
+                    clip_slides = sorted(
+                        s for s in st.session_state.local_avatar_clips.keys()
+                        if s in eligible_slides
+                    )
+                    if clip_slides:
+                        clip_slide = st.selectbox(
+                            "Xem thử clip nhép môi",
+                            clip_slides,
+                            format_func=lambda n: f"Slide {n}",
+                            key="local_avatar_review_slide",
+                        )
+                        st.video(st.session_state.local_avatar_clips[clip_slide])
 
         if st.button("Tạo video", type="primary", use_container_width=True):
             if voice_engine in {"uploaded", "voice_clone"} and not voice_upload_unlocked:
@@ -1056,11 +1506,32 @@ with tab_export:
                 st.error("Chế độ AI nhép môi cần ảnh người dẫn và GPU API URL.")
                 st.stop()
             if presenter_mode == "AI nhép môi bằng OpenAvatar Runtime":
-                expected = [r["slide"] for r in records if not r.get("skip") and r.get("narration", "").strip()]
-                missing = [slide for slide in expected if slide not in st.session_state.local_avatar_clips]
+                expected = [
+                    r["slide"] for r in records
+                    if not r.get("skip") and r.get("narration", "").strip()
+                ]
+                missing = [
+                    slide for slide in expected
+                    if slide not in st.session_state.local_avatar_clips
+                ]
                 if missing:
-                    st.error(f"Chưa tạo đủ clip OpenAvatar Runtime. Còn thiếu slide: {missing[:10]}")
+                    st.error(
+                        f"Chưa tạo đủ clip OpenAvatar Runtime. Còn thiếu slide: {missing[:10]}"
+                    )
                     st.stop()
+
+                if voice_engine == "voice_clone":
+                    missing_local_audio = [
+                        slide for slide in expected
+                        if slide not in st.session_state.local_avatar_audio
+                    ]
+                    if missing_local_audio:
+                        st.error(
+                            "Audio F5-TTS local không còn trong phiên cho slide: "
+                            + ", ".join(map(str, missing_local_audio[:10]))
+                            + ". Hãy bấm Continue/Retry trong Resume Job Dashboard để khôi phục từ browser cache."
+                        )
+                        st.stop()
             invalid = [r["slide"] for r in records if profanity.contains_profanity(r.get("narration", ""))]
             if invalid:
                 st.error(f"Không thể render. Lời thuyết minh chứa nội dung không phù hợp tại slide: {invalid}")
@@ -1128,9 +1599,64 @@ with tab_export:
                     st.error("Chưa tải ảnh cho slide " + " và ".join(missing_boundary_images) + ".")
                     st.stop()
 
-                scene_audio_assets = [
-                    audio_asset_for_scene(scene, recorded_voice_assets) for scene in scenes
-                ]
+                # IMPORTANT:
+                # Khi Streamlit chạy trên Cloud, voice_clone localhost:8009 chỉ có thể
+                # được gọi từ Browser Bridge. Đến bước "Tạo video" TUYỆT ĐỐI không
+                # synthesize lại từ Python server trên Cloud. Dùng lại audio WAV đã
+                # chuẩn bị trong st.session_state.local_avatar_audio.
+                if (
+                    presenter_mode == "AI nhép môi bằng OpenAvatar Runtime"
+                    and voice_engine == "voice_clone"
+                ):
+                    scene_audio_assets = []
+                    for scene in scenes:
+                        slide_key = (
+                            scene.source_slide_number
+                            if scene.source_slide_number is not None
+                            else scene.slide_number
+                        )
+                        audio_bytes = (
+                            st.session_state.local_avatar_audio.get(slide_key)
+                            if slide_key is not None
+                            else None
+                        )
+
+                        # Boundary scene có thể có bản thu upload riêng.
+                        if audio_bytes is None:
+                            uploaded_asset = audio_asset_for_scene(
+                                scene, recorded_voice_assets
+                            )
+                            if uploaded_asset is not None:
+                                scene_audio_assets.append(uploaded_asset)
+                                continue
+
+                        scene_audio_assets.append(
+                            AudioAsset(
+                                data=audio_bytes,
+                                filename=f"slide_{int(slide_key):03d}.wav",
+                            )
+                            if audio_bytes
+                            else None
+                        )
+
+                    missing_local_audio = [
+                        scene_label(scene)
+                        for scene, audio_asset in zip(scenes, scene_audio_assets)
+                        if scene.narration.strip() and audio_asset is None
+                    ]
+                    if missing_local_audio:
+                        st.error(
+                            "Chưa có audio local cho: "
+                            + ", ".join(missing_local_audio[:12])
+                            + ". Hãy chạy Resume Job Dashboard để tạo/khôi phục audio trước khi Tạo video."
+                        )
+                        st.stop()
+                else:
+                    scene_audio_assets = [
+                        audio_asset_for_scene(scene, recorded_voice_assets)
+                        for scene in scenes
+                    ]
+
                 if voice_engine == "uploaded":
                     missing_audio = [
                         scene_label(scene)
@@ -1158,7 +1684,11 @@ with tab_export:
                     st.stop()
 
                 try:
-                    with st.spinner("Đang tạo audio từng slide và ghép video..."):
+                    with st.spinner(
+                        "Đang ghép video từ audio/clip đã chuẩn bị..."
+                        if presenter_mode == "AI nhép môi bằng OpenAvatar Runtime"
+                        else "Đang tạo audio từng slide và ghép video..."
+                    ):
                         temp_dir = Path(tempfile.mkdtemp(prefix="ppt_video_studio_"))
                         video_path = temp_dir / "ppt_video.mp4"
                         srt_path = temp_dir / "ppt_video.srt"

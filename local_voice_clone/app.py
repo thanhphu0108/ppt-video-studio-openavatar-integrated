@@ -72,8 +72,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Permit only loopback web apps.  This is useful when the PPT app is run
-# locally through Streamlit, without making the FastAPI service network-wide.
+# Browser bridge CORS:
+# - local Streamlit during development
+# - Streamlit Community Cloud (*.streamlit.app)
+#
+# The API itself still binds only to 127.0.0.1, so this does NOT expose
+# port 8009 to the LAN/Internet.  It only permits an already-open browser
+# page from an approved origin to call the user's local service.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -82,9 +87,15 @@ app.add_middleware(
         "http://127.0.0.1:8009",
         "http://localhost:8009",
     ],
+    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)*streamlit\.app",
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Voice-Upload-Password"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-API-Key",
+        "X-Voice-Upload-Password",
+    ],
 )
 
 

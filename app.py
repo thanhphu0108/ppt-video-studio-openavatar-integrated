@@ -967,6 +967,8 @@ with tab_export:
                         voice_id="default",
                         model=voice_clone_config.model or "f5-tts",
                         api_key=voice_clone_config.api_key or "",
+                        voice_use_consent=bool(voice_clone_config.voice_use_consent),
+                        upload_password=voice_clone_config.upload_password or "",
                         request_id=f"voice-slide-{current_slide}",
                         key=f"voice_clone_{current_slide}",
                     )

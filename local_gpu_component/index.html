@@ -97,9 +97,15 @@ async function execute(){
       fd.append('voice_id',args.voice_id||'default');
       fd.append('model',args.model||'f5-tts');
       if(args.reference_text) fd.append('reference_text',args.reference_text);
+      fd.append('voice_use_consent', args.voice_use_consent ? 'true' : 'false');
+      fd.append('language','vi');
+      fd.append('speed','1.0');
+      fd.append('output_format','wav');
+      fd.append('return_audio','true');
 
       const headers={};
-      if(args.api_key) headers['Authorization']='Bearer '+args.api_key;
+      if(args.api_key) headers['X-API-Key']=args.api_key;
+      if(args.upload_password) headers['X-Voice-Upload-Password']=args.upload_password;
 
       const r=await fetch(base+'/v1/voice-clone/synthesize',{
         method:'POST',headers,body:fd
@@ -110,8 +116,10 @@ async function execute(){
         try{
           const p=await r.json();
           detail=p.message||p.detail||JSON.stringify(p);
-        }catch(_){ detail=await r.text(); }
-        throw new Error(detail||('HTTP '+r.status));
+        }catch(_){
+          try{ detail=await r.text(); }catch(__){}
+        }
+        throw new Error('HTTP '+r.status+(detail ? ': '+detail : ''));
       }
 
       const ct=(r.headers.get('content-type')||'').toLowerCase();

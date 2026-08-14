@@ -32,6 +32,8 @@ class SynthesisResult:
     cache_hit: bool
     inference_seconds: float
     normalized_text: str
+    queue_wait_seconds: float = 0.0
+    total_seconds: float = 0.0
 
     def to_dict(self, *, audio_url: str | None = None) -> dict[str, Any]:
         output = {
@@ -46,6 +48,8 @@ class SynthesisResult:
             "warnings": self.warnings,
             "cache_hit": self.cache_hit,
             "inference_seconds": round(self.inference_seconds, 3),
+            "queue_wait_seconds": round(self.queue_wait_seconds, 3),
+            "total_seconds": round(self.total_seconds, 3),
         }
         if audio_url:
             output["audio_url"] = audio_url
@@ -308,14 +312,27 @@ class SynthesisService:
                     sample_rate=int(cached_metadata.get("sample_rate", self.settings.output_sample_rate)),
                     warnings=list(dict.fromkeys(warnings + cached_warnings)),
                     cache_hit=True,
-                    inference_seconds=elapsed,
+                    inference_seconds=0.0,
                     normalized_text=normalized_text,
+                    queue_wait_seconds=0.0,
+                    total_seconds=elapsed,
                 )
 
-            chunks = chunk_text(normalized_text, self.settings.max_chars_per_chunk)
+            # Vira ULTRA V3 owns its chunking internally. Passing the full
+            # normalized narration as one service-level chunk prevents
+            # double chunking (service -> engine -> internal chunks).
+            if selected_engine == "vira-tts":
+                chunks = [(normalized_text, False)]
+            else:
+                chunks = chunk_text(normalized_text, self.settings.max_chars_per_chunk)
+
             if not chunks:
                 raise VoiceCloneServiceError("TEXT_EMPTY", "Không tách được text thành chunk.")
+
+            queue_started = time.perf_counter()
             with self._inference_lock:
+                queue_wait_seconds = time.perf_counter() - queue_started
+                inference_started = time.perf_counter()
                 try:
                     generated_wav = self._render_chunks(
                         engine=engine,
@@ -329,8 +346,22 @@ class SynthesisService:
                 except Exception as exc:
                     if not self._is_oom(exc):
                         raise
+
                     self._clear_cuda_cache()
-                    smaller_chunks = chunk_text(normalized_text, max(50, self.settings.max_chars_per_chunk // 2))
+
+                    # Vira has its own internal chunk/retry strategy. Do not
+                    # introduce a second service-level chunking layer.
+                    if selected_engine == "vira-tts":
+                        raise VoiceCloneServiceError(
+                            "GPU_OUT_OF_MEMORY",
+                            f"GPU hết bộ nhớ khi chạy Vira-TTS: {exc}",
+                            status_code=503,
+                        ) from exc
+
+                    smaller_chunks = chunk_text(
+                        normalized_text,
+                        max(50, self.settings.max_chars_per_chunk // 2),
+                    )
                     try:
                         generated_wav = self._render_chunks(
                             engine=engine,
@@ -349,6 +380,8 @@ class SynthesisService:
                             status_code=503,
                         ) from retry_exc
 
+                inference_seconds = time.perf_counter() - inference_started
+
             inspection: AudioInspection = self.audio.inspect(generated_wav)
             warnings.extend(self.audio.quality_warnings(inspection))
             if selected_format == "wav":
@@ -357,7 +390,7 @@ class SynthesisService:
                 self.audio.convert_to_mp3(generated_wav, destination)
             if not destination.exists() or destination.stat().st_size == 0:
                 raise VoiceCloneServiceError("MODEL_INFERENCE_ERROR", "Không ghi được output audio.", status_code=500)
-            elapsed = time.perf_counter() - started_at
+            total_seconds = time.perf_counter() - started_at
             metadata = {
                 "duration_seconds": inspection.duration_seconds,
                 "sample_rate": inspection.sample_rate,
@@ -368,14 +401,18 @@ class SynthesisService:
             }
             self.cache.store(cache_key, selected_format, destination, metadata)
             self.logger.info(
-                "synthesis request_id=%s model=%s voice_id=%s text_length=%d ref=%s cache_hit=false duration=%.3f inference_seconds=%.3f device=%s",
+                "synthesis request_id=%s model=%s voice_id=%s text_length=%d ref=%s "
+                "cache_hit=false duration=%.3f inference_seconds=%.3f "
+                "queue_wait_seconds=%.3f total_seconds=%.3f device=%s",
                 request_id,
                 selected_engine,
                 effective_voice_id,
                 len(normalized_text),
                 prepared_reference.name,
                 inspection.duration_seconds,
-                elapsed,
+                inference_seconds,
+                queue_wait_seconds,
+                total_seconds,
                 engine.status().device,
             )
             return SynthesisResult(
@@ -388,8 +425,10 @@ class SynthesisService:
                 sample_rate=inspection.sample_rate,
                 warnings=list(dict.fromkeys(warnings)),
                 cache_hit=False,
-                inference_seconds=elapsed,
+                inference_seconds=inference_seconds,
                 normalized_text=normalized_text,
+                queue_wait_seconds=queue_wait_seconds,
+                total_seconds=total_seconds,
             )
         except VoiceCloneServiceError:
             raise

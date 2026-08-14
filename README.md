@@ -5,7 +5,7 @@
 ## Tính năng hoàn chỉnh
 
 - Đọc và làm sạch nội dung PowerPoint.
-- Render nguyên hình slide bằng LibreOffice + Poppler.
+- Render nguyên hình slide bằng Microsoft PowerPoint COM trên Windows; fallback sang LibreOffice + Poppler/PyMuPDF.
 - Giữ nền, ảnh, biểu đồ, SmartArt, bảng và bố cục ở dạng tĩnh.
 - Phân loại slide và sinh lời thuyết minh tiếng Việt.
 - Storyboard chỉnh sửa từng slide, tải mẫu CSV/Excel và nhập CSV/Excel/JSON project.
@@ -14,9 +14,12 @@
 - Import/export từ điển.
 - Kiểm duyệt từ ngữ không phù hợp khi thêm, import và render.
 - Chọn slide PowerPoint, slide hệ thống hoặc ảnh tải lên làm intro/outro, mỗi loại đều có lời thuyết minh riêng.
-- Ba nguồn giọng: Edge TTS, bản thu thật theo từng slide và nhân bản giọng local F5-TTS qua API riêng có xác nhận quyền sử dụng giọng.
+- Bốn nguồn giọng: Edge TTS, VieNeu-TTS local, bản thu thật theo từng slide và nhân bản giọng local F5-TTS qua API riêng có xác nhận quyền sử dụng giọng.
 - Các luồng tải audio giọng được bảo vệ bằng mật khẩu theo phiên sử dụng.
 - Phụ đề đốt vào video và file SRT.
+- Phụ đề đốt chạy kiểu karaoke theo cụm ngắn, cố định khung và tự ẩn sau lời nói; cỡ chữ cấu hình từ 10 px.
+- Tùy chỉnh màu nền, màu chữ, độ rộng khung theo phần trăm và căn giữa/góc cho phụ đề.
+- Có chế độ giữ nguyên khung slide PPT, tắt zoom/crop/fade để mọi nguồn audio dùng cùng hình gốc.
 - Fade, zoom nhẹ và hiệu ứng người dẫn.
 - Ảnh người dẫn tĩnh hoặc hiệu ứng nói nhẹ.
 - AI nhép môi qua GPU API từ xa.
@@ -45,7 +48,7 @@ Voice clone là service riêng, không phải OpenAvatar Runtime:
 Storyboard / lời thuyết minh
               │
               ▼
-Local Voice Clone Service (F5-TTS)
+Local Voice Service (F5-TTS / VieNeu-TTS)
 http://127.0.0.1:8009
               │ WAV mono
               ▼
@@ -59,13 +62,19 @@ Talking-head video
 `8008` chỉ nhận audio đã có để nhép môi; không clone hoặc render giọng. Hướng
 dẫn cài Local Voice Clone Service ở [local_voice_clone/README.md](local_voice_clone/README.md).
 
+VieNeu cũng đi qua service `8009`: Browser Bridge gửi text/voice ID từ trình
+duyệt tới service local, service nạp model và GPU trên máy người dùng rồi trả
+WAV về Streamlit. Vì vậy Streamlit Cloud không cần cài hoặc tải model VieNeu.
+
 Streamlit Cloud không gọi trực tiếp `localhost`. Custom Streamlit Component trong repository này thực hiện request từ trình duyệt:
 
 1. `GET /health`
 2. `POST /avatar/generate`
 3. Poll `GET /jobs/{job_id}`
 4. `GET /jobs/{job_id}/download`
-5. Chuyển MP4 về phiên Streamlit để ghép vào slide.
+5. `GET /v1/vieneu/voices` và `POST /v1/voice-clone/synthesize` hoặc
+   `POST /v1/storyboard/synthesize` cho VieNeu local.
+6. Chuyển MP4/WAV về phiên Streamlit để ghép vào slide.
 
 ## Chạy local
 
@@ -75,6 +84,34 @@ python -m venv .venv
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+Trên Windows, nếu dùng PowerPoint để render, `requirements.txt` sẽ cài thêm
+`pywin32`; app tự khởi tạo COM trong thread của Streamlit. Nếu máy không có
+PowerPoint, cài LibreOffice để dùng renderer dự phòng.
+
+### VieNeu-TTS local
+
+Trong tab **4. Xuất video**, chọn **VieNeu-TTS local**. App dùng Browser Bridge
+trong `local_gpu_component/index.html` để lấy danh sách preset và gửi từng đoạn
+text tới `http://127.0.0.1:8009`; model/audio không chạy trên Streamlit Cloud.
+VieNeu-TTS hiện yêu cầu Python 3.10+ và được cài trong môi trường của
+`local_voice_clone`:
+
+```bat
+cd local_voice_clone
+python -m pip install -r requirements.txt
+start.bat
+```
+
+Nếu môi trường local đã cài service trước đó, cập nhật riêng:
+
+```bat
+python -m pip install -U vieneu
+```
+
+Có thể đặt `VIENEU_BACKEND=onnx` để buộc backend ONNX/CPU. Để chạy VieNeu
+trực tiếp trong Python của Streamlit local (không khuyến nghị khi deploy Cloud),
+đặt `VIENEU_DIRECT_PYTHON=true`.
 
 ## Deploy Streamlit Community Cloud
 

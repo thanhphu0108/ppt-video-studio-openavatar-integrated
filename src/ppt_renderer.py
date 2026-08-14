@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import tempfile
+import os
 from pathlib import Path
 
 from PIL import Image
@@ -17,6 +18,45 @@ def _find_command(*names: str) -> str | None:
         path = shutil.which(name)
         if path:
             return path
+
+    # Windows installers thường không thêm LibreOffice/Poppler vào PATH.
+    # Tìm thêm các vị trí cài đặt mặc định để app local không báo thiếu
+    # dù chương trình đã được cài trên máy.
+    if os.name == "nt":
+        program_roots = [
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+
+        for name in names:
+            lowered = name.lower()
+            candidates: list[Path] = []
+
+            if lowered in {"libreoffice", "soffice"}:
+                for root in program_roots:
+                    if root:
+                        candidates.append(
+                            Path(root) / "LibreOffice" / "program" / "soffice.exe"
+                        )
+            elif lowered == "pdftoppm":
+                for root in program_roots[:2]:
+                    if root:
+                        base = Path(root)
+                        candidates.extend(
+                            [
+                                base / "poppler" / "Library" / "bin" / "pdftoppm.exe",
+                                base / "poppler" / "bin" / "pdftoppm.exe",
+                            ]
+                        )
+                        candidates.extend(
+                            base.glob("poppler*/Library/bin/pdftoppm.exe")
+                        )
+
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate)
+
     return None
 
 
@@ -25,6 +65,7 @@ def _render_with_powerpoint_com(
     work: Path,
 ) -> list[Image.Image]:
     try:
+        import pythoncom
         import win32com.client
     except ImportError as exc:
         raise PowerPointRenderError(
@@ -36,8 +77,15 @@ def _render_with_powerpoint_com(
 
     app = None
     presentation = None
+    com_initialized = False
 
     try:
+        # Streamlit chạy mỗi lần xử lý trong một thread riêng. COM không tự
+        # được khởi tạo trong thread đó, nên DispatchEx có thể lỗi:
+        # "CoInitialize has not been called".
+        pythoncom.CoInitialize()
+        com_initialized = True
+
         app = win32com.client.DispatchEx("PowerPoint.Application")
 
         # Với một số bản Office, Visible=0 có thể không ổn định.
@@ -75,6 +123,12 @@ def _render_with_powerpoint_com(
                 app.Quit()
         except Exception:
             pass
+
+        if com_initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     # PowerPoint thường sinh Slide1.PNG, Slide2.PNG...
     paths = list(export_dir.glob("*.PNG"))
@@ -120,11 +174,6 @@ def _render_with_libreoffice(
             "Không tìm thấy LibreOffice."
         )
 
-    if not pdftoppm:
-        raise PowerPointRenderError(
-            "Không tìm thấy pdftoppm."
-        )
-
     profile_dir = work / "lo_profile"
     profile_dir.mkdir(exist_ok=True)
 
@@ -160,48 +209,86 @@ def _render_with_libreoffice(
             detail[-1200:]
         )
 
-    prefix = work / "slide"
     scale = max(72, int(dpi))
 
-    result = subprocess.run(
-        [
-            pdftoppm,
-            "-png",
-            "-r",
-            str(scale),
-            str(pdf_path),
-            str(prefix),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=240,
-    )
+    if pdftoppm:
+        prefix = work / "slide"
 
-    paths = sorted(
-        work.glob("slide-*.png"),
-        key=lambda p: int(
-            p.stem.split("-")[-1]
-        ),
-    )
-
-    if result.returncode != 0 or not paths:
-        detail = (
-            result.stderr
-            or "Không chuyển được PDF sang ảnh."
-        ).strip()
-
-        raise PowerPointRenderError(
-            detail[-1200:]
+        result = subprocess.run(
+            [
+                pdftoppm,
+                "-png",
+                "-r",
+                str(scale),
+                str(pdf_path),
+                str(prefix),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=240,
         )
 
-    images: list[Image.Image] = []
+        paths = sorted(
+            work.glob("slide-*.png"),
+            key=lambda p: int(
+                p.stem.split("-")[-1]
+            ),
+        )
 
-    for path in paths:
-        with Image.open(path) as image:
-            images.append(
-                image.convert("RGB").copy()
+        if result.returncode != 0 or not paths:
+            detail = (
+                result.stderr
+                or "Không chuyển được PDF sang ảnh."
+            ).strip()
+
+            raise PowerPointRenderError(
+                detail[-1200:]
             )
+
+        images: list[Image.Image] = []
+
+        for path in paths:
+            with Image.open(path) as image:
+                images.append(
+                    image.convert("RGB").copy()
+                )
+
+        return images
+
+    # PyMuPDF đã là dependency của app, nên dùng làm fallback local khi
+    # Poppler chưa được thêm vào PATH. LibreOffice vẫn giữ nguyên bố cục;
+    # chỉ thay cách rasterize PDF thành PNG.
+    try:
+        import fitz
+    except ImportError as exc:
+        raise PowerPointRenderError(
+            "Không tìm thấy pdftoppm và chưa cài PyMuPDF để rasterize PDF."
+        ) from exc
+
+    try:
+        pdf = fitz.open(str(pdf_path))
+        matrix = fitz.Matrix(scale / 72.0, scale / 72.0)
+        images = []
+        for page in pdf:
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            images.append(
+                Image.frombytes(
+                    "RGB",
+                    [pixmap.width, pixmap.height],
+                    pixmap.samples,
+                )
+            )
+        pdf.close()
+    except Exception as exc:
+        raise PowerPointRenderError(
+            f"Không chuyển được PDF sang ảnh bằng PyMuPDF: {exc}"
+        ) from exc
+
+    if not images:
+        raise PowerPointRenderError(
+            "LibreOffice tạo PDF nhưng PDF không có trang slide."
+        )
 
     return images
 

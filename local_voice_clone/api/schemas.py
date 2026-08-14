@@ -34,10 +34,10 @@ class StoryboardSlide(BaseModel):
 class StoryboardSynthesisRequest(BaseModel):
     model: str = "f5-tts"
     voice_id: str = "default"
+    voice_style: str = "tu_nhien"
     reference_text: str | None = None
     language: str = "vi"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     output_format: Literal["wav", "mp3"] = "wav"
     continue_on_error: bool = False
     slides: list[StoryboardSlide]
-

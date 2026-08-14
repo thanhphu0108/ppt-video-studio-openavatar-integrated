@@ -23,7 +23,7 @@ from src.moderation import ProfanityFilter
 from src.ppt_reader import build_narration, read_pptx
 from src.ppt_renderer import PowerPointRenderError, render_pptx_slides
 from src.pronunciation import apply_dictionary, dictionary_json, load_dictionary, parse_dictionary_bytes, validate_entry
-from src.slide_builder import build_boundary_slide, build_content_slide
+from src.slide_builder import build_boundary_slide
 from src.storyboard_io import (
     apply_storyboard_updates,
     prepare_storyboard_updates,
@@ -37,6 +37,12 @@ from src.avatar_api import AvatarApiConfig, check_avatar_api, generate_talking_h
 from src.local_gpu_bridge import local_gpu_bridge, decode_video_result, decode_audio_result
 from src.voice_clone import VoiceCloneConfig
 from src.voice_access import verify_voice_upload_password
+from src.vieneu_tts import (
+    SUPPORTED_STYLES as VIENEU_STYLES,
+    list_vieneu_voices,
+    vieneu_available,
+    vieneu_install_hint,
+)
 
 # OpenAvatar SDK chỉ dùng khi Streamlit chạy hoàn toàn trên máy local.
 # Khi deploy trên Streamlit Cloud, phải dùng Browser Bridge vì Python server
@@ -194,6 +200,11 @@ def reset_presentation_editing_state() -> None:
         "voice_clone_verify_ssl",
         "voice_clone_consent",
         "local_voice_upload_password",
+        "vieneu_service_url",
+        "vieneu_service_api_key",
+        "vieneu_voice_id",
+        "vieneu_voice_id_fallback",
+        "vieneu_style",
     ):
         st.session_state.pop(key, None)
     st.session_state.intro_upload = None
@@ -215,6 +226,19 @@ def reset_presentation_editing_state() -> None:
     st.session_state.auto_export_requested = False
 
 
+def _require_original_ppt_slide(slide_number: int) -> Image.Image:
+    """Return a real rendered PPT slide; never replace it with a text mockup."""
+
+    images = st.session_state.get("original_slide_images", [])
+    index = int(slide_number) - 1
+    if index < 0 or index >= len(images):
+        raise PowerPointRenderError(
+            f"Chưa có ảnh render gốc cho slide {slide_number}. "
+            "Hãy render lại PowerPoint trước khi xuất video."
+        )
+    return images[index].copy()
+
+
 def configured_voice_upload_password() -> str | None:
     """Cho phép thay mật khẩu ngoài source qua environment hoặc Streamlit secrets."""
 
@@ -226,6 +250,28 @@ def configured_voice_upload_password() -> str | None:
     except Exception:
         from_secrets = ""
     return from_secrets or None
+
+
+def configured_voice_clone_api_key() -> str:
+    """Read the token used by the local Voice Clone service, if configured.
+
+    ``start_f5_8009.bat`` names this token ``LOCAL_API_KEY`` while the
+    Streamlit UI uses the less ambiguous ``VOICE_CLONE_API_KEY`` name.  The
+    latter wins so a deployment can keep its own secret namespace.
+    """
+
+    for name in ("VOICE_CLONE_API_KEY", "LOCAL_API_KEY"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    try:
+        for name in ("VOICE_CLONE_API_KEY", "LOCAL_API_KEY"):
+            value = str(st.secrets.get(name, "")).strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return ""
 
 
 def clear_voice_upload_session() -> None:
@@ -526,6 +572,8 @@ def _audio_job_cache_key(
     voice_engine: str,
     voice_id: str,
     voice_rate: str,
+    vieneu_style: str = "tu_nhien",
+    vieneu_service_url: str = "",
 ) -> str:
     narration = apply_dictionary(rec.get("narration", ""), st.session_state.dictionary)
     payload = {
@@ -534,6 +582,9 @@ def _audio_job_cache_key(
         "voice_engine": voice_engine,
         "voice_id": voice_id,
         "voice_rate": voice_rate,
+        "vieneu_style": vieneu_style,
+        "vieneu_backend": os.getenv("VIENEU_BACKEND", "") if voice_engine == "vieneu" else "",
+        "vieneu_service_url": vieneu_service_url if voice_engine == "vieneu" else "",
         "model": voice_clone_config.model if voice_clone_config else "",
         "reference_text": voice_clone_config.reference_transcript if voice_clone_config else "",
         "reference_audio_sha256": _pipeline_sha256(
@@ -668,6 +719,8 @@ def _pipeline_audio_cache_key(
     voice_engine: str,
     voice_id: str,
     voice_rate: str,
+    vieneu_style: str = "tu_nhien",
+    vieneu_service_url: str = "",
 ) -> str:
     payload = {
         "scene_key": str(item["key"]),
@@ -676,6 +729,9 @@ def _pipeline_audio_cache_key(
         "voice_engine": voice_engine,
         "voice_id": voice_id,
         "voice_rate": voice_rate,
+        "vieneu_style": vieneu_style,
+        "vieneu_backend": os.getenv("VIENEU_BACKEND", "") if voice_engine == "vieneu" else "",
+        "vieneu_service_url": vieneu_service_url if voice_engine == "vieneu" else "",
         "model": voice_clone_config.model if voice_clone_config else "",
         "reference_text": (
             voice_clone_config.reference_transcript if voice_clone_config else ""
@@ -783,7 +839,7 @@ def _direct_voice_clone_synthesize(
         "text": text,
         "reference_text": reference_text or "",
         "voice_id": voice_id or "default",
-        "model": model or "vira-tts",
+        "model": model or "f5-tts",
         "language": "vi",
         "speed": "1.0",
         "output_format": "wav",
@@ -831,6 +887,11 @@ def _direct_voice_clone_synthesize(
             )
         except Exception:
             detail = response.text[-2000:]
+        if response.status_code == 401:
+            detail = (
+                f"{detail} Hãy nhập đúng LOCAL_API_KEY của service 8009 "
+                "vào ô API key; đây không phải mật khẩu mở khóa upload."
+            ).strip()
         return {
             "ok": False,
             "error": f"Voice Clone HTTP {response.status_code}: {detail}",
@@ -877,12 +938,23 @@ def _direct_voice_clone_synthesize(
 
     if payload.get("audio_url"):
         try:
+            audio_headers = {"X-API-Key": api_key} if api_key else {}
             audio_response = requests.get(
                 payload["audio_url"],
+                headers=audio_headers,
                 timeout=(8, 300),
             )
             audio_response.raise_for_status()
         except requests.RequestException as exc:
+            if getattr(exc.response, "status_code", None) == 401:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Không tải được WAV đã synthesize: HTTP 401. "
+                        "Service 8009 yêu cầu LOCAL_API_KEY khi tải audio."
+                    ),
+                    "request_id": request_id,
+                }
             return {
                 "ok": False,
                 "error": f"Không tải được WAV đã synthesize: {exc}",
@@ -936,7 +1008,7 @@ with tab_upload:
         organization = st.text_input("Tên đơn vị", value=st.session_state.get("organization", ""))
         st.session_state.organization = organization
     with right:
-        st.info("App dùng python-pptx để lấy nội dung thuyết minh và dùng LibreOffice để render nguyên hình slide. Nền, ảnh, biểu đồ, SmartArt và bố cục được giữ ở dạng tĩnh; animation và video nhúng không được phát lại.")
+        st.info("App dùng python-pptx để đọc nội dung và ưu tiên Microsoft PowerPoint COM trên Windows để render nguyên hình slide; nếu không có thì dùng LibreOffice. Nền, ảnh, biểu đồ, SmartArt và bố cục được giữ ở dạng tĩnh; animation và video nhúng không được phát lại.")
 
     if uploaded:
         payload = uploaded.getvalue()
@@ -968,7 +1040,7 @@ with tab_upload:
                     st.session_state.original_slide_images = rendered
                     st.session_state.render_backend = backend
                 except Exception as render_exc:
-                    st.session_state.render_backend = "Dựng lại từ text"
+                    st.session_state.render_backend = "Không có ảnh gốc"
                     st.session_state.render_warning = str(render_exc)
                 st.success(f"Đã phân tích {len(records)} slide từ {uploaded.name}.")
             except Exception as exc:
@@ -983,9 +1055,16 @@ with tab_upload:
         c4.metric("Tổng số từ", sum(r["word_count"] for r in records))
         st.write(f"**Nguồn hình slide:** {st.session_state.render_backend}")
         if st.session_state.render_warning:
-            st.warning(
-                "Không render được hình gốc nên app đang dựng lại slide từ text. "
+            st.error(
+                "Không render được hình gốc. App sẽ không dùng slide dựng lại từ text "
+                "để tránh làm sai bố cục PowerPoint. "
                 f"Chi tiết: {st.session_state.render_warning}"
+            )
+            st.info(
+                "Nếu đang chạy Windows, hãy khởi động lại Streamlit rồi tải lại PPT "
+                "để PowerPoint COM được khởi tạo đúng thread. Nếu máy không có "
+                "Microsoft PowerPoint, hãy cài LibreOffice; app có thể dùng PyMuPDF "
+                "nên không bắt buộc phải cài thêm Poppler ở máy local."
             )
         elif st.session_state.original_slide_images:
             st.success("Đã render nguyên hình slide để dùng trong video.")
@@ -1229,17 +1308,34 @@ with tab_export:
         st.subheader("Giọng đọc")
         voice_source = st.radio(
             "Nguồn giọng đọc",
-            ["AI tiếng Việt", "Bản thu thật theo từng slide", "Nhân bản giọng từ mẫu (API riêng)"],
+            [
+                "AI tiếng Việt",
+                "VieNeu-TTS local",
+                "Bản thu thật theo từng slide",
+                "Nhân bản giọng từ mẫu (API riêng)",
+            ],
             horizontal=True,
             key="voice_source",
         )
         voice_engine = "edge"
         voice_id = "vi-VN-HoaiMyNeural"
         voice_rate = "+0%"
+        vieneu_style = "tu_nhien"
+        vieneu_service_url = os.getenv(
+            "VIENEU_SERVICE_URL", "http://127.0.0.1:8009"
+        ).strip().rstrip("/")
+        vieneu_service_api_key = (
+            os.getenv("VIENEU_SERVICE_API_KEY", "").strip()
+            or configured_voice_clone_api_key()
+        )
+        vieneu_direct_python = (
+            os.getenv("VIENEU_DIRECT_PYTHON", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         voice_clone_config = None
         voice_clone_consent = False
         recorded_voice_assets: dict[int | str, AudioAsset] = {}
-        voice_upload_unlocked = voice_source == "AI tiếng Việt"
+        voice_upload_unlocked = voice_source in {"AI tiếng Việt", "VieNeu-TTS local"}
 
         if not voice_upload_unlocked:
             voice_upload_unlocked = unlock_voice_uploads()
@@ -1256,6 +1352,124 @@ with tab_export:
                 index=2,
             )
             st.caption("Dùng Edge TTS; audio được tạo riêng cho từng slide để khớp phụ đề và avatar.")
+        elif voice_source == "VieNeu-TTS local":
+            voice_engine = "vieneu"
+            st.caption(
+                "Browser Bridge sẽ gọi VieNeu-TTS trên service local, không chạy model "
+                "trong Streamlit Cloud. Nếu service 8009 chạy bằng "
+                "start_f5_8009.bat, nhập LOCAL_API_KEY ở ô dưới."
+            )
+            vieneu_service_url = st.text_input(
+                "VieNeu local service URL",
+                value=vieneu_service_url,
+                placeholder="http://127.0.0.1:8009",
+                key="vieneu_service_url",
+                help=(
+                    "Service phải chạy trên cùng máy với trình duyệt. Mặc định dùng "
+                    "local_voice_clone tại cổng 8009."
+                ),
+            ).strip().rstrip("/")
+            vieneu_service_api_key = st.text_input(
+                "VieNeu service API key (nếu có)",
+                value=vieneu_service_api_key,
+                type="password",
+                key="vieneu_service_api_key",
+                help=(
+                    "Phải trùng LOCAL_API_KEY của service 8009 nếu bạn chạy "
+                    "start_f5_8009.bat; có thể đặt VIENEU_SERVICE_API_KEY "
+                    "hoặc VOICE_CLONE_API_KEY trong Streamlit secrets."
+                ),
+            ).strip()
+            vieneu_style = st.selectbox(
+                "Phong cách đọc",
+                options=list(VIENEU_STYLES),
+                format_func=lambda style: VIENEU_STYLES[style],
+                key="vieneu_style",
+                help=(
+                    "Một số bản VieNeu v3 Turbo đã mã hóa phong cách trong giọng preset "
+                    "và có thể bỏ qua tùy chọn này."
+                ),
+            )
+            voice_list_result = local_gpu_bridge(
+                action="vieneu_voices",
+                agent_url=vieneu_service_url or "http://127.0.0.1:8009",
+                api_key=vieneu_service_api_key,
+                request_id="vieneu-voices",
+                key="vieneu_voice_list",
+            )
+            vieneu_voices: list[tuple[str, str]] = []
+            if isinstance(voice_list_result, dict) and voice_list_result.get("ok"):
+                payload = voice_list_result.get("payload") or {}
+                voice_items = payload.get("voices", []) if isinstance(payload, dict) else []
+                for item in voice_items:
+                    if not isinstance(item, dict):
+                        continue
+                    voice_key = str(item.get("id") or item.get("voice_id") or "").strip()
+                    label = str(item.get("label") or voice_key).strip()
+                    if voice_key:
+                        vieneu_voices.append((label, voice_key))
+
+            # Direct Python is an explicit opt-in for a fully local Streamlit
+            # deployment. It is disabled by default so Cloud cannot load the
+            # VieNeu model accidentally on the Streamlit server.
+            if not vieneu_voices and vieneu_direct_python:
+                if not vieneu_available():
+                    st.warning("Chưa cài VieNeu-TTS trong môi trường Streamlit local.")
+                    st.code(vieneu_install_hint())
+                else:
+                    try:
+                        vieneu_voices = list_vieneu_voices()
+                    except Exception as exc:
+                        st.error(f"Không đọc được danh sách giọng VieNeu-TTS: {exc}")
+
+            if vieneu_voices:
+                voice_options = [voice_key for _, voice_key in vieneu_voices]
+                voice_labels = {voice_key: label for label, voice_key in vieneu_voices}
+                env_voice = os.getenv("VIENEU_VOICE", "").strip()
+                default_index = (
+                    voice_options.index(env_voice)
+                    if env_voice in voice_options
+                    else 0
+                )
+                voice_id = st.selectbox(
+                    "Giọng VieNeu-TTS",
+                    options=voice_options,
+                    index=default_index,
+                    format_func=lambda selected: voice_labels.get(selected, selected),
+                    key="vieneu_voice_id",
+                )
+                st.caption(f"Đã nhận {len(vieneu_voices)} giọng preset từ VieNeu-TTS local.")
+            else:
+                voice_id = st.text_input(
+                    "Voice ID VieNeu-TTS (tùy chọn)",
+                    value=os.getenv("VIENEU_VOICE", ""),
+                    key="vieneu_voice_id_fallback",
+                    help="Để trống để dùng giọng mặc định của model.",
+                ).strip()
+                if isinstance(voice_list_result, dict) and voice_list_result.get("ok") is False:
+                    vieneu_error = str(
+                        voice_list_result.get("error", "Không có chi tiết lỗi.")
+                    )
+                    if any(
+                        marker in vieneu_error.lower()
+                        for marker in ("hub", "checkpoint", "model", "cache")
+                    ):
+                        st.warning(
+                            "Đã gọi được service 8009 nhưng model VieNeu chưa sẵn sàng. "
+                            "Khởi động lại start_f5_8009.bat sau khi tải model rồi tải lại trang."
+                        )
+                    else:
+                        st.warning(
+                            "Chưa kết nối được VieNeu local service. Hãy chạy "
+                            "local_voice_clone/start_f5_8009.bat rồi tải lại trang."
+                        )
+                    st.caption(vieneu_error)
+                elif not vieneu_direct_python:
+                    st.info(
+                        "Chưa nhận danh sách giọng. Chạy service local tại "
+                        f"{vieneu_service_url or 'http://127.0.0.1:8009'}; "
+                        "có thể nhập Voice ID thủ công trong lúc chờ kết nối."
+                    )
         elif voice_source == "Bản thu thật theo từng slide":
             voice_engine = "uploaded"
             if voice_upload_unlocked:
@@ -1296,15 +1510,20 @@ with tab_export:
                 )
                 clone_model = model_col.text_input(
                     "Model",
-                    value=os.getenv("VOICE_CLONE_MODEL", "vira-tts"),
-                    help="Khuyến nghị vira-tts cho tiếng Việt local; f5-tts vẫn được hỗ trợ.",
+                    value=os.getenv("VOICE_CLONE_MODEL", "f5-tts"),
+                    help="Đang dùng start_f5_8009.bat nên chọn f5-tts; chỉ chọn vira-tts khi service Vira đang chạy.",
                     key="voice_clone_model",
                 )
                 clone_api_key = st.text_input(
-                    "API key (nếu có)",
-                    value=os.getenv("VOICE_CLONE_API_KEY", ""),
+                    "LOCAL_API_KEY của service 8009",
+                    value=configured_voice_clone_api_key(),
                     type="password",
                     key="voice_clone_api_key",
+                    help=(
+                        "Phải trùng LOCAL_API_KEY trong start_f5_8009.bat "
+                        "(hoặc biến môi trường của service). Không nhập mật "
+                        "khẩu mở khóa upload vào ô này."
+                    ),
                 )
                 local_voice_upload_password = st.text_input(
                     "Mật khẩu Local Voice Clone (8009)",
@@ -1342,6 +1561,11 @@ with tab_export:
                         upload_password=str(local_voice_upload_password or ""),
                         verify_ssl=clone_verify_ssl,
                     )
+                if ":8009" in clone_endpoint and not clone_api_key.strip():
+                    st.warning(
+                        "Service 8009 đang yêu cầu LOCAL_API_KEY. Nếu để trống "
+                        "ô trên, bước tạo audio sẽ trả HTTP 401."
+                    )
                 st.info(
                     "Local Voice Clone Service mặc định chạy tại 127.0.0.1:8009: audio và text không rời máy. "
                     "Mẫu giọng chỉ được giữ trong phiên xuất và không được đưa vào file project tải xuống."
@@ -1351,9 +1575,56 @@ with tab_export:
 
         render_col, subtitle_col, fps_col = st.columns(3)
         burn_subtitles = render_col.checkbox("Đốt phụ đề vào video", value=True)
-        subtitle_position = subtitle_col.selectbox("Vị trí phụ đề", ["Dưới", "Giữa"])
+        subtitle_position = subtitle_col.selectbox(
+            "Độ cao phụ đề",
+            ["Dưới", "Giữa"],
+            help="Chọn phụ đề nằm phía dưới hoặc giữa khung hình.",
+        )
         fps = fps_col.selectbox("FPS", [12, 15, 24], index=1)
-        subtitle_font_size = st.slider("Cỡ chữ phụ đề", 20, 40, 28)
+        subtitle_font_size = st.slider("Cỡ chữ phụ đề", 10, 60, 28)
+        subtitle_background_color = "#000000"
+        subtitle_text_color = "#FFFFFF"
+        subtitle_box_width_percent = 85
+        subtitle_alignment = "Canh giữa"
+        if burn_subtitles:
+            subtitle_style_cols = st.columns(4)
+            subtitle_background_color = subtitle_style_cols[0].color_picker(
+                "Màu nền khung",
+                value="#000000",
+                key="subtitle_background_color",
+            )
+            subtitle_text_color = subtitle_style_cols[1].color_picker(
+                "Màu chữ",
+                value="#FFFFFF",
+                key="subtitle_text_color",
+            )
+            subtitle_box_width_percent = subtitle_style_cols[2].slider(
+                "Độ rộng khung (%)",
+                min_value=40,
+                max_value=100,
+                value=85,
+                key="subtitle_box_width_percent",
+                help="Tỷ lệ chiều rộng khung phụ đề so với video.",
+            )
+            subtitle_alignment = subtitle_style_cols[3].selectbox(
+                "Căn khung",
+                ["Canh giữa", "Góc trái", "Góc phải"],
+                key="subtitle_alignment",
+                help="Canh giữa hoặc đặt khung về góc trái/góc phải.",
+            )
+        st.caption(
+            "Phụ đề chạy kiểu karaoke theo từng cụm ngắn, không dồn cả đoạn; "
+            "hết lời sẽ ẩn khỏi khung hình. Có thể chọn màu, độ rộng và căn giữa/góc. "
+            "Cỡ chữ từ 10 trở lên."
+        )
+        preserve_original_slide = st.checkbox(
+            "Giữ nguyên khung slide PPT (không zoom/crop/fade)",
+            value=True,
+            help=(
+                "Giữ nguyên hình ảnh và mép slide gốc cho mọi nguồn audio. "
+                "Bỏ chọn nếu muốn dùng hiệu ứng zoom/fade nhẹ."
+            ),
+        )
 
         st.divider()
         st.subheader("Người dẫn ở góc video")
@@ -1455,6 +1726,8 @@ with tab_export:
                             st.error(str(sdk_result))
 
                 st.info(
+                    "OpenAvatar chỉ nhận audio từ Nguồn giọng đọc ở phía trên để nhép môi; "
+                    "không cần Voice Clone API nếu bạn chọn Edge, bản thu hoặc VieNeu local. "
                     "Trước khi tạo avatar, chạy OpenAvatar Runtime bằng "
                     "`installer/start_agent.cmd`, rồi kiểm tra "
                     "`http://127.0.0.1:8008/health`."
@@ -1512,6 +1785,7 @@ with tab_export:
                                         voice_engine=voice_engine,
                                         voice_id=voice_id,
                                         voice_rate=voice_rate,
+                                        vieneu_style=vieneu_style,
                                         voice_clone_config=voice_clone_config,
                                         uploaded_audio=audio_asset_for_scene(preview_scene, recorded_voice_assets),
                                     )
@@ -1622,7 +1896,8 @@ with tab_export:
                 with st.expander("🎙️ Audio ngoài theo từng slide / cắt từ một bản thu dài", expanded=False):
                     st.caption(
                         "Có thể thay audio AI cho từng scene. Ưu tiên: audio chọn ở đây → "
-                        "audio upload theo tên slide → Vira-TTS. Timecode nhận MM:SS hoặc HH:MM:SS."
+                        "audio upload theo tên slide → engine giọng đang chọn. "
+                        "Timecode nhận MM:SS hoặc HH:MM:SS."
                     )
 
                     master_file = st.file_uploader(
@@ -1824,7 +2099,15 @@ with tab_export:
 
                 if batch_all:
                     if voice_engine == "voice_clone" and voice_clone_config is None:
-                        st.error("Chưa cấu hình Voice Clone.")
+                        st.error(
+                            "Bạn đang chọn nguồn giọng ‘Nhân bản giọng từ mẫu (API riêng)’ "
+                            "nhưng chưa tải mẫu giọng và xác nhận quyền sử dụng."
+                        )
+                        st.info(
+                            "OpenAvatar chỉ làm nhép môi, không tự tạo giọng. "
+                            "Muốn dùng VieNeu, chọn ‘VieNeu-TTS local’ ở mục Nguồn giọng đọc; "
+                            "muốn dùng F5 clone thì tải mẫu giọng và cấu hình service 8009."
+                        )
                         st.stop()
 
                     targets = list(lipsync_keys)
@@ -1844,6 +2127,8 @@ with tab_export:
                             voice_engine,
                             voice_id,
                             voice_rate,
+                            vieneu_style,
+                            vieneu_service_url,
                         )
                         if key not in st.session_state.local_avatar_audio:
                             try:
@@ -1958,7 +2243,14 @@ with tab_export:
 
                 if create_audio:
                     if voice_engine == "voice_clone" and voice_clone_config is None:
-                        st.error("Chưa cấu hình Voice Clone.")
+                        st.error(
+                            "Bạn đang chọn nguồn giọng ‘Nhân bản giọng từ mẫu (API riêng)’ "
+                            "nhưng chưa tải mẫu giọng và xác nhận quyền sử dụng."
+                        )
+                        st.info(
+                            "Nếu không muốn dùng Voice Clone, đổi Nguồn giọng đọc sang "
+                            "‘VieNeu-TTS local’ hoặc ‘AI tiếng Việt’."
+                        )
                     else:
                         pending = []
                         for key in narration_keys:
@@ -1968,7 +2260,9 @@ with tab_export:
                         st.session_state.local_voice_queue = _queue_unique(pending)
                         st.rerun()
 
-                # Voice Clone via browser -> localhost:8009.
+                # Audio synthesis queue. VieNeu and voice-clone requests use the
+                # browser bridge by default so Streamlit Cloud never touches the
+                # user's local GPU service. Edge/uploaded audio stays in Python.
                 voice_queue = st.session_state.local_voice_queue
                 if voice_queue:
                     current_key = voice_queue[0]
@@ -1979,13 +2273,16 @@ with tab_export:
 
                     _set_local_job(current_key, "Processing", "Audio")
 
-                    clone_endpoint = voice_clone_config.endpoint.rstrip("/")
-                    marker = "/v1/voice-clone/synthesize"
-                    voice_base_url = (
-                        clone_endpoint[:-len(marker)]
-                        if clone_endpoint.endswith(marker)
-                        else clone_endpoint
-                    )
+                    clone_endpoint = ""
+                    voice_base_url = ""
+                    if voice_engine == "voice_clone" and voice_clone_config is not None:
+                        clone_endpoint = voice_clone_config.endpoint.rstrip("/")
+                        marker = "/v1/voice-clone/synthesize"
+                        voice_base_url = (
+                            clone_endpoint[:-len(marker)]
+                            if clone_endpoint.endswith(marker)
+                            else clone_endpoint
+                        )
 
                     done = sum(
                         1
@@ -1994,7 +2291,11 @@ with tab_export:
                     )
                     st.progress(
                         done / max(1, len(narration_keys)),
-                        text=f"{(voice_clone_config.model or 'voice-clone')}: {current_item['label']}",
+                        text=(
+                            f"VieNeu-TTS ({voice_id or 'mặc định'}): {current_item['label']}"
+                            if voice_engine == "vieneu"
+                            else f"{(voice_clone_config.model if voice_clone_config else 'voice-clone')}: {current_item['label']}"
+                        ),
                     )
 
                     audio_cache_key = _pipeline_audio_cache_key(
@@ -2003,6 +2304,8 @@ with tab_export:
                         voice_engine,
                         voice_id,
                         voice_rate,
+                        vieneu_style,
+                        vieneu_service_url,
                     )
                     # Re-check persistent disk cache immediately before making
                     # an expensive GPU request. This protects against Streamlit
@@ -2045,10 +2348,10 @@ with tab_export:
 
                         st.rerun()
 
-                    # FAST local path. A blocking Python request executes exactly
-                    # once per Streamlit run, unlike an auto-executing browser
-                    # component which may be rendered repeatedly.
-                    use_direct_python = (
+                    # Direct voice-clone Python is kept for a fully local app.
+                    # VieNeu has a separate explicit opt-in below; its default
+                    # path is always the browser bridge.
+                    use_direct_clone_python = (
                         os.getenv("VOICE_CLONE_DIRECT_PYTHON", "true")
                         .strip()
                         .lower()
@@ -2056,44 +2359,103 @@ with tab_export:
                     )
 
                     voice_result = None
-                    if use_direct_python:
-                        voice_result = _direct_voice_clone_synthesize(
-                            endpoint=clone_endpoint,
-                            reference_audio=voice_clone_config.reference_audio,
-                            reference_filename=voice_clone_config.reference_filename,
-                            text=current_item["narration"],
-                            reference_text=voice_clone_config.reference_transcript or "",
-                            voice_id="default",
-                            model=voice_clone_config.model or "vira-tts",
-                            api_key=voice_clone_config.api_key or "",
-                            upload_password=voice_clone_config.upload_password or "",
-                            voice_use_consent=bool(
-                                voice_clone_config.voice_use_consent
-                            ),
-                            request_id=f"voice-scene-{current_key}",
-                        )
+                    if voice_engine == "voice_clone":
+                        if use_direct_clone_python:
+                            voice_result = _direct_voice_clone_synthesize(
+                                endpoint=clone_endpoint,
+                                reference_audio=voice_clone_config.reference_audio,
+                                reference_filename=voice_clone_config.reference_filename,
+                                text=current_item["narration"],
+                                reference_text=voice_clone_config.reference_transcript or "",
+                                voice_id="default",
+                                model=voice_clone_config.model or "f5-tts",
+                                api_key=voice_clone_config.api_key or "",
+                                upload_password=voice_clone_config.upload_password or "",
+                                voice_use_consent=bool(
+                                    voice_clone_config.voice_use_consent
+                                ),
+                                request_id=f"voice-scene-{current_key}",
+                            )
 
-                    # Cloud fallback: Python cannot reach the user's localhost,
-                    # therefore let the browser call 8009.
-                    if voice_result is None:
+                        # Cloud fallback: Python cannot reach the user's
+                        # localhost, therefore let the browser call 8009.
+                        if voice_result is None:
+                            voice_result = local_gpu_bridge(
+                                action="voice_synthesize",
+                                agent_url=voice_base_url,
+                                reference_audio_bytes=voice_clone_config.reference_audio,
+                                reference_audio_filename=voice_clone_config.reference_filename,
+                                text=current_item["narration"],
+                                reference_text=voice_clone_config.reference_transcript or "",
+                                voice_id="default",
+                                model=voice_clone_config.model or "f5-tts",
+                                api_key=voice_clone_config.api_key or "",
+                                voice_use_consent=bool(
+                                    voice_clone_config.voice_use_consent
+                                ),
+                                upload_password=voice_clone_config.upload_password or "",
+                                request_id=f"voice-scene-{current_key}",
+                                cache_key=audio_cache_key,
+                                key=f"voice_clone_scene_{current_key}",
+                            )
+                    elif voice_engine == "vieneu" and not vieneu_direct_python:
                         voice_result = local_gpu_bridge(
                             action="voice_synthesize",
-                            agent_url=voice_base_url,
-                            reference_audio_bytes=voice_clone_config.reference_audio,
-                            reference_audio_filename=voice_clone_config.reference_filename,
+                            agent_url=vieneu_service_url or "http://127.0.0.1:8009",
+                            api_key=vieneu_service_api_key,
                             text=current_item["narration"],
-                            reference_text=voice_clone_config.reference_transcript or "",
-                            voice_id="default",
-                            model=voice_clone_config.model or "f5-tts",
-                            api_key=voice_clone_config.api_key or "",
-                            voice_use_consent=bool(
-                                voice_clone_config.voice_use_consent
-                            ),
-                            upload_password=voice_clone_config.upload_password or "",
+                            voice_id=voice_id or "default",
+                            model="vieneu",
+                            voice_style=vieneu_style,
                             request_id=f"voice-scene-{current_key}",
                             cache_key=audio_cache_key,
-                            key=f"voice_clone_scene_{current_key}",
+                            key=f"vieneu_scene_{current_key}",
                         )
+                    else:
+                        # Edge/uploaded audio, plus the explicit
+                        # VIENEU_DIRECT_PYTHON opt-in, run in this Streamlit
+                        # process.
+                        try:
+                            item_key = current_item["key"]
+                            is_boundary = current_item.get("kind") in {"intro", "outro"}
+                            numeric_key = None if is_boundary else int(item_key)
+                            local_scene = VideoScene(
+                                title=current_item["label"],
+                                narration=current_item["narration"],
+                                slide_number=numeric_key or 0,
+                                source_slide_number=numeric_key,
+                                slide_type=current_item.get("kind", "content"),
+                            )
+                            uploaded_asset = (
+                                audio_asset_for_scene(local_scene, recorded_voice_assets)
+                                if voice_engine == "uploaded"
+                                else None
+                            )
+                            with tempfile.TemporaryDirectory(prefix="local_tts_scene_") as temp_dir:
+                                generated_path = synthesize_scene_audio(
+                                    local_scene,
+                                    Path(temp_dir) / "narration.wav",
+                                    voice_engine=voice_engine,
+                                    voice_id=voice_id,
+                                    voice_rate=voice_rate,
+                                    vieneu_style=vieneu_style,
+                                    uploaded_audio=uploaded_asset,
+                                )
+                                audio_bytes = generated_path.read_bytes() if generated_path else b""
+                            voice_result = {
+                                "ok": bool(audio_bytes),
+                                "kind": "audio",
+                                "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                                "content_type": "audio/wav",
+                                "transport": f"{voice_engine}-python",
+                                "request_id": f"voice-scene-{current_key}",
+                            }
+                        except Exception as exc:
+                            voice_result = {
+                                "ok": False,
+                                "error": str(exc),
+                                "request_id": f"voice-scene-{current_key}",
+                            }
 
                     if isinstance(voice_result, dict) and voice_result.get("ok"):
                         # Browser Bridge may return the service request_id instead of
@@ -2170,8 +2532,7 @@ with tab_export:
                             st.rerun()
                         else:
                             message = (
-                                "Voice Clone báo thành công nhưng Browser Bridge "
-                                "không trả audio_base64."
+                                "Bộ tổng hợp giọng báo thành công nhưng không trả audio."
                             )
                             _set_local_job(
                                 current_key, "Failed", "Audio", error=message
@@ -2187,7 +2548,7 @@ with tab_export:
                         and voice_result.get("ok") is False
                     ):
                         message = voice_result.get(
-                            "error", "Local Voice Clone xử lý thất bại"
+                            "error", "Bộ tổng hợp giọng local xử lý thất bại"
                         )
                         _set_local_job(
                             current_key, "Failed", "Audio", error=message
@@ -2387,6 +2748,13 @@ with tab_export:
             )
 
         if create_video_clicked or auto_export_now:
+            if len(st.session_state.get("original_slide_images", [])) != len(records):
+                st.error(
+                    "Chưa có đủ ảnh render gốc của PowerPoint nên không thể xuất video. "
+                    "Audio VieNeu/F5/Edge/bản thu không thay đổi slide; hãy sửa lỗi render "
+                    "ở tab PowerPoint rồi tải lại file."
+                )
+                st.stop()
             if voice_engine in {"uploaded", "voice_clone"} and not voice_upload_unlocked:
                 st.error("Cần nhập mật khẩu để dùng giọng tải lên.")
                 st.stop()
@@ -2395,7 +2763,11 @@ with tab_export:
                     st.error("Cần xác nhận quyền sử dụng giọng trước khi nhân bản giọng.")
                     st.stop()
                 if voice_clone_config is None or not voice_clone_config.endpoint.strip():
-                    st.error("Cần tải mẫu giọng và nhập Voice-clone API endpoint trước khi tạo video.")
+                    st.error(
+                        "Nguồn giọng đang là ‘Nhân bản giọng từ mẫu (API riêng)’. "
+                        "Hãy tải mẫu giọng và nhập endpoint 8009; hoặc đổi Nguồn giọng đọc "
+                        "sang VieNeu-TTS local nếu không muốn dùng Voice Clone."
+                    )
                     st.stop()
             if presenter_mode == "AI nhép môi qua GPU API" and (ai_avatar_config is None or avatar_image is None):
                 st.error("Chế độ AI nhép môi cần ảnh người dẫn và GPU API URL.")
@@ -2467,7 +2839,7 @@ with tab_export:
                             slide_type=side,
                             source_slide_number=rec["slide"],
                         ))
-                        images.append(st.session_state.original_slide_images[rec["slide"] - 1].copy() if st.session_state.original_slide_images else build_content_slide(rec["title"], rec["bullets"], st.session_state.organization, side))
+                        images.append(_require_original_ppt_slide(rec["slide"]))
                     elif mode == "uploaded_image":
                         payload = st.session_state.intro_upload if side == "intro" else st.session_state.outro_upload
                         if payload:
@@ -2491,7 +2863,7 @@ with tab_export:
                     if rec["slide"] in excluded or rec.get("skip"):
                         continue
                     scenes.append(VideoScene(title=rec["title"], bullets=tuple(rec["bullets"]), narration=apply_dictionary(rec["narration"], st.session_state.dictionary), slide_number=rec["slide"], slide_type=rec["slide_type"], pause_after=rec.get("pause_after", 0.35), source_slide_number=rec["slide"]))
-                    images.append(st.session_state.original_slide_images[rec["slide"] - 1].copy() if st.session_state.original_slide_images else build_content_slide(rec["title"], rec["bullets"], st.session_state.organization))
+                    images.append(_require_original_ppt_slide(rec["slide"]))
                 add_boundary("outro")
 
                 missing_boundary_images = [
@@ -2504,14 +2876,79 @@ with tab_export:
                     st.error("Chưa tải ảnh cho slide " + " và ".join(missing_boundary_images) + ".")
                     st.stop()
 
+                # Non-OpenAvatar exports still need local VieNeu audio. Use one
+                # Browser Bridge storyboard request so the Cloud Streamlit
+                # process never falls back to ``synthesize_scene_audio``.
+                browser_vieneu_assets: dict[str, AudioAsset] = {}
+                if (
+                    voice_engine == "vieneu"
+                    and presenter_mode != "AI nhép môi bằng OpenAvatar Runtime"
+                    and not vieneu_direct_python
+                ):
+                    batch_items = [
+                        {"key": f"scene-{index}", "text": scene.narration}
+                        for index, scene in enumerate(scenes)
+                        if scene.narration.strip()
+                    ]
+                    batch_result = local_gpu_bridge(
+                        action="voice_synthesize_batch",
+                        agent_url=vieneu_service_url or "http://127.0.0.1:8009",
+                        api_key=vieneu_service_api_key,
+                        voice_id=voice_id or "default",
+                        model="vieneu",
+                        voice_style=vieneu_style,
+                        storyboard=batch_items,
+                        request_id="vieneu-export-batch",
+                        key="vieneu_export_batch",
+                    )
+                    if not isinstance(batch_result, dict):
+                        st.session_state.auto_export_requested = True
+                        st.info(
+                            "Đang gửi storyboard tới VieNeu local service trong trình duyệt. "
+                            "Giữ tab này mở; audio sẽ được trả về trước khi ghép video."
+                        )
+                        st.stop()
+                    if batch_result.get("ok") is not True:
+                        st.session_state.auto_export_requested = False
+                        st.error(
+                            "VieNeu local service không tạo được audio: "
+                            + str(batch_result.get("error", "Không có chi tiết lỗi."))
+                        )
+                        st.stop()
+                    for item in batch_result.get("items", []):
+                        if not isinstance(item, dict) or not item.get("key"):
+                            continue
+                        try:
+                            audio_bytes = base64.b64decode(item.get("audio_base64", ""))
+                        except (TypeError, ValueError):
+                            audio_bytes = b""
+                        if audio_bytes:
+                            browser_vieneu_assets[str(item["key"])] = AudioAsset(
+                                data=audio_bytes,
+                                filename=f"{item['key']}.wav",
+                            )
+                    missing_browser_audio = [
+                        scene_label(scene)
+                        for index, scene in enumerate(scenes)
+                        if scene.narration.strip()
+                        and f"scene-{index}" not in browser_vieneu_assets
+                    ]
+                    if missing_browser_audio:
+                        st.session_state.auto_export_requested = False
+                        st.error(
+                            "VieNeu local service trả thiếu audio cho: "
+                            + ", ".join(missing_browser_audio[:12])
+                        )
+                        st.stop()
+
                 # IMPORTANT:
-                # Khi Streamlit chạy trên Cloud, voice_clone localhost:8009 chỉ có thể
-                # được gọi từ Browser Bridge. Đến bước "Tạo video" TUYỆT ĐỐI không
-                # synthesize lại từ Python server trên Cloud. Dùng lại audio WAV đã
-                # chuẩn bị trong st.session_state.local_avatar_audio.
+                # Với voice clone/VieNeu + OpenAvatar, audio đã chuẩn bị trong
+                # Resume Job Dashboard phải được dùng lại ở bước xuất. Không
+                # synthesize lại từ Streamlit server sau khi Browser/CPU local đã
+                # tạo xong audio.
                 if (
                     presenter_mode == "AI nhép môi bằng OpenAvatar Runtime"
-                    and voice_engine == "voice_clone"
+                    and voice_engine in {"voice_clone", "vieneu"}
                 ):
                     scene_audio_assets = []
                     for scene in scenes:
@@ -2565,6 +3002,12 @@ with tab_export:
                             + ". Hãy chạy Resume Job Dashboard để tạo/khôi phục audio trước khi Tạo video."
                         )
                         st.stop()
+                elif browser_vieneu_assets:
+                    scene_audio_assets = [
+                        browser_vieneu_assets.get(f"scene-{index}")
+                        or audio_asset_for_scene(scene, recorded_voice_assets)
+                        for index, scene in enumerate(scenes)
+                    ]
                 else:
                     scene_audio_assets = [
                         audio_asset_for_scene(scene, recorded_voice_assets)
@@ -2600,10 +3043,10 @@ with tab_export:
                 try:
                     if (
                         presenter_mode == "AI nhép môi bằng OpenAvatar Runtime"
-                        and voice_engine == "voice_clone"
+                        and voice_engine in {"voice_clone", "vieneu"}
                     ):
                         st.caption(
-                            "Export mode: pre-generated local audio — không gọi F5-TTS từ Streamlit Cloud."
+                            "Export mode: pre-generated local audio — không gọi lại engine local từ Streamlit Cloud."
                         )
 
                     with st.spinner(
@@ -2631,7 +3074,11 @@ with tab_export:
                         export_voice_clone_config = voice_clone_config
                         if (
                             presenter_mode == "AI nhép môi bằng OpenAvatar Runtime"
-                            and voice_engine == "voice_clone"
+                            and voice_engine in {"voice_clone", "vieneu"}
+                        ) or (
+                            voice_engine == "vieneu"
+                            and not vieneu_direct_python
+                            and bool(browser_vieneu_assets)
                         ):
                             export_voice_engine = "uploaded"
                             export_voice_clone_config = None
@@ -2640,10 +3087,16 @@ with tab_export:
                             scenes, video_path, fps=fps, with_voice=True,
                             voice_engine=export_voice_engine, voice_id=voice_id,
                             voice_rate=voice_rate,
+                            vieneu_style=vieneu_style,
                             voice_clone_config=export_voice_clone_config,
                             scene_audio_assets=scene_audio_assets,
                             slide_images=images, burn_subtitles=burn_subtitles,
                             subtitle_position=subtitle_position, subtitle_font_size=subtitle_font_size,
+                            subtitle_background_color=subtitle_background_color,
+                            subtitle_text_color=subtitle_text_color,
+                            subtitle_box_width_percent=subtitle_box_width_percent,
+                            subtitle_alignment=subtitle_alignment,
+                            preserve_original_slide=preserve_original_slide,
                             srt_path=srt_path, avatar_image=avatar_image,
                             avatar_position=avatar_position, avatar_size_percent=avatar_size_percent,
                             avatar_shape=avatar_shape, avatar_border_width=avatar_border_width,
@@ -2657,8 +3110,9 @@ with tab_export:
                             "organization": st.session_state.organization,
                             "voice": {
                                 "source": voice_engine,
-                                "voice_id": voice_id if voice_engine == "edge" else None,
+                                "voice_id": voice_id if voice_engine in {"edge", "vieneu"} else None,
                                 "voice_rate": voice_rate if voice_engine == "edge" else None,
+                                "voice_style": vieneu_style if voice_engine == "vieneu" else None,
                                 "voice_clone_model": voice_clone_config.model if voice_clone_config else None,
                                 "has_recorded_audio": bool(recorded_voice_assets),
                             },

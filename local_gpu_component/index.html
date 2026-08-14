@@ -66,6 +66,8 @@ async function cachePut(key,kind,contentType,base64){
 }
 
 function arrayBufferToBase64(buffer){ const bytes=new Uint8Array(buffer); let binary=''; const chunk=0x8000; for(let i=0;i<bytes.length;i+=chunk){binary+=String.fromCharCode.apply(null,bytes.subarray(i,Math.min(i+chunk,bytes.length)));} return btoa(binary); }
+function utf8ToBase64(value){ return arrayBufferToBase64(new TextEncoder().encode(value).buffer); }
+function base64ToUtf8(value){ const binary=atob(value); const bytes=new Uint8Array(binary.length); for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i); return new TextDecoder().decode(bytes); }
 async function execute(){
   runBtn.disabled=true; statusEl.className='muted';
   const base=(args.agent_url||'http://127.0.0.1:8008').replace(/\/$/,'');
@@ -152,6 +154,69 @@ async function execute(){
       return;
     }
 
+    if(args.action==='vieneu_voices'){
+      const voicesCacheKey='vieneu-voices:'+base;
+      const cached=await cacheGet(voicesCacheKey);
+      if(cached && cached.base64){
+        try{
+          const cachedPayload=JSON.parse(base64ToUtf8(cached.base64));
+          statusEl.className='ok';
+          statusEl.textContent='✓ Đã nhận danh sách giọng VieNeu từ browser cache.';
+          value({ok:true,kind:'vieneu_voices',payload:cachedPayload,cache_hit:true,request_id:args.request_id});
+          return;
+        }catch(_){ /* stale cache from an older component build; refresh it */ }
+      }
+      statusEl.textContent='Đang lấy danh sách giọng VieNeu từ máy local…';
+      const headers={};
+      if(args.api_key) headers['X-API-Key']=args.api_key;
+      const r=await fetch(base+'/v1/vieneu/voices',{method:'GET',headers});
+      const payload=await r.json();
+      if(!r.ok) throw new Error(payload.detail||payload.message||('HTTP '+r.status));
+      await cachePut(voicesCacheKey,'json','application/json',utf8ToBase64(JSON.stringify(payload)));
+      statusEl.className='ok';
+      statusEl.textContent='✓ Đã nhận danh sách giọng VieNeu từ local GPU service.';
+      value({ok:true,kind:'vieneu_voices',payload,request_id:args.request_id});
+      return;
+    }
+
+    if(args.action==='voice_synthesize_batch'){
+      const items=Array.isArray(args.storyboard_data) ? args.storyboard_data : [];
+      if(!items.length) throw new Error('Không có scene VieNeu cần tạo audio.');
+      statusEl.textContent='Đang tạo audio VieNeu theo storyboard trên GPU local…';
+      const headers={'Content-Type':'application/json'};
+      if(args.api_key) headers['X-API-Key']=args.api_key;
+      const body={
+        model:'vieneu',
+        voice_id:args.voice_id||'default',
+        voice_style:args.voice_style||'tu_nhien',
+        language:'vi', speed:1.0, output_format:'wav', continue_on_error:false,
+        slides:items.map((item,index)=>({slide:index+1,text:item.text||''}))
+      };
+      const r=await fetch(base+'/v1/storyboard/synthesize',{
+        method:'POST',headers,body:JSON.stringify(body)
+      });
+      const payload=await r.json();
+      if(!r.ok) throw new Error(payload.detail||payload.message||('HTTP '+r.status));
+      const rendered=[];
+      for(const file of (payload.files||[])){
+        if(file.status!=='SUCCESS') throw new Error(file.message||file.error||('Không tạo được slide '+file.slide));
+        const source=items[(Number(file.slide)||1)-1];
+        if(!source) throw new Error('Không ghép được audio với scene '+file.slide+'.');
+        const audioUrl=new URL(file.audio_url,base).toString();
+        const ar=await fetch(audioUrl,{headers:args.api_key?{'X-API-Key':args.api_key}:{}});
+        if(!ar.ok) throw new Error('Không tải được audio scene '+file.slide+': HTTP '+ar.status);
+        rendered.push({
+          key:source.key,
+          audio_base64:arrayBufferToBase64(await ar.arrayBuffer()),
+          content_type:(ar.headers.get('content-type')||'audio/wav')
+        });
+      }
+      statusEl.className='ok';
+      statusEl.textContent='✓ Đã tạo xong audio VieNeu trên GPU local.';
+      value({ok:true,kind:'audio_batch',items:rendered,payload,transport:'browser-bridge',request_id:args.request_id});
+      return;
+    }
+
     if(args.action==='voice_synthesize'){
       if(args.cache_key){
         const cached=await cacheGet('audio:'+args.cache_key);
@@ -167,16 +232,21 @@ async function execute(){
           return;
         }
       }
-      statusEl.textContent='Đang tạo giọng bằng F5-TTS trên GPU local…';
-      if(!args.reference_audio_data_url) throw new Error('Thiếu mẫu giọng.');
+      statusEl.textContent=(args.model||'').toLowerCase()==='vieneu'
+        ? 'Đang tạo giọng VieNeu trên GPU local…'
+        : 'Đang tạo giọng bằng F5-TTS trên GPU local…';
+      if((args.model||'').toLowerCase()!=='vieneu' && !args.reference_audio_data_url) throw new Error('Thiếu mẫu giọng.');
       if(!args.text) throw new Error('Thiếu nội dung cần đọc.');
 
       const fd=new FormData();
-      fd.append('reference_audio',dataUrlToBlob(args.reference_audio_data_url),
-                args.reference_audio_filename||'reference.wav');
+      if(args.reference_audio_data_url){
+        fd.append('reference_audio',dataUrlToBlob(args.reference_audio_data_url),
+                  args.reference_audio_filename||'reference.wav');
+      }
       fd.append('text',args.text||'');
       fd.append('voice_id',args.voice_id||'default');
       fd.append('model',args.model||'f5-tts');
+      fd.append('voice_style',args.voice_style||'tu_nhien');
       if(args.reference_text) fd.append('reference_text',args.reference_text);
       fd.append('voice_use_consent', args.voice_use_consent ? 'true' : 'false');
       fd.append('language','vi');
@@ -199,7 +269,10 @@ async function execute(){
         }catch(_){
           try{ detail=await r.text(); }catch(__){}
         }
-        throw new Error('HTTP '+r.status+(detail ? ': '+detail : ''));
+        const authHint=r.status===401
+          ? ' Service 8009 yêu cầu LOCAL_API_KEY; hãy nhập đúng key của start_f5_8009.bat vào ô API key.'
+          : '';
+        throw new Error('HTTP '+r.status+(detail ? ': '+detail : '')+authHint);
       }
 
       const ct=(r.headers.get('content-type')||'').toLowerCase();
@@ -235,8 +308,15 @@ async function execute(){
       if(payload.audio_url){
         const audioUrl=new URL(payload.audio_url,base).toString();
         statusEl.textContent='Đang tải audio từ Local Voice Clone…';
-        const ar=await fetch(audioUrl);
-        if(!ar.ok) throw new Error('Không tải được audio: HTTP '+ar.status);
+        const audioHeaders={};
+        if(args.api_key) audioHeaders['X-API-Key']=args.api_key;
+        const ar=await fetch(audioUrl,{headers:audioHeaders});
+        if(!ar.ok){
+          const authHint=ar.status===401
+            ? ' Service 8009 yêu cầu LOCAL_API_KEY khi tải audio.'
+            : '';
+          throw new Error('Không tải được audio: HTTP '+ar.status+authHint);
+        }
         const buf=await ar.arrayBuffer();
         const audioB64=arrayBufferToBase64(buf);
         const audioCt=(ar.headers.get('content-type')||'audio/wav');
@@ -258,10 +338,10 @@ async function execute(){
   }catch(e){ statusEl.className='err'; statusEl.textContent='Không gọi được dịch vụ local: '+e.message; value({ok:false,error:String(e.message||e),request_id:args.request_id}); }
   finally{runBtn.disabled=false;}
 }
-window.addEventListener('message',e=>{ const d=e.data||{}; if(d.type==='streamlit:render'){ args=d.args||{}; runBtn.style.display = args.action==='voice_synthesize' ? 'none' : 'inline-block';
+window.addEventListener('message',e=>{ const d=e.data||{}; if(d.type==='streamlit:render'){ args=d.args||{}; runBtn.style.display = ['voice_synthesize','voice_synthesize_batch','vieneu_voices'].includes(args.action) ? 'none' : 'inline-block';
     runBtn.textContent =
       (args.action==='health' || args.action==='voice_health') ? 'Kiểm tra lại' :
-      'Tạo avatar bằng OpenAvatar Runtime'; runBtn.onclick=execute; if(args.action==='health' || args.action==='voice_health' || args.action==='voice_synthesize') {
+      'Tạo avatar bằng OpenAvatar Runtime'; runBtn.onclick=execute; if(args.action==='health' || args.action==='voice_health' || args.action==='voice_synthesize' || args.action==='voice_synthesize_batch' || args.action==='vieneu_voices') {
       execute();
     } else {
       statusEl.textContent='Sẵn sàng gửi dữ liệu tới OpenAvatar Runtime trên máy này.';

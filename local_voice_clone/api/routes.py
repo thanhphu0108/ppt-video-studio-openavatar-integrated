@@ -142,6 +142,34 @@ def create_router(service: SynthesisService, settings: Settings) -> APIRouter:
         _assert_local_api_key(request, settings)
         return {"voices": service.profiles.list(), "default_voice_id": settings.default_voice_id}
 
+    @router.get("/v1/vieneu/voices")
+    def vieneu_voices(request: Request) -> dict[str, Any]:
+        """Return preset voices from the local VieNeu model.
+
+        This endpoint is intentionally separate from ``/v1/voices``: the
+        latter lists uploaded/reference profiles, while VieNeu voices are
+        built into the local model and do not have a reference WAV.
+        """
+
+        _assert_local_api_key(request, settings)
+        try:
+            engine = service.engine("vieneu")
+            voices = engine.list_preset_voices()  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise VoiceCloneServiceError(
+                "MODEL_NOT_LOADED",
+                f"Không đọc được danh sách giọng VieNeu: {exc}",
+                status_code=503,
+            ) from exc
+        return {
+            "voices": [
+                {"label": label, "id": voice_id, "available": True}
+                for label, voice_id in voices
+            ],
+            "default_voice_id": voices[0][1] if voices else "",
+            "model": "vieneu",
+        }
+
     async def synthesize_common(request: Request) -> JSONResponse | FileResponse:
         payload = await parse_compatibility_request(request)
         _assert_local_api_key(request, settings, payload.api_key)
@@ -159,6 +187,7 @@ def create_router(service: SynthesisService, settings: Settings) -> APIRouter:
                 text=payload.text,
                 reference_audio=uploaded_reference,
                 reference_text=payload.reference_text,
+                voice_style=payload.voice_style,
                 language=payload.language,
                 speed=payload.speed,
                 output_format=payload.output_format,
@@ -199,6 +228,7 @@ def create_router(service: SynthesisService, settings: Settings) -> APIRouter:
                     voice_id=payload.voice_id,
                     text=item.text,
                     reference_text=payload.reference_text,
+                    voice_style=payload.voice_style,
                     language=payload.language,
                     speed=payload.speed,
                     output_format=payload.output_format,

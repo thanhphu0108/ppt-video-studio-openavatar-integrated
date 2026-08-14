@@ -18,6 +18,7 @@ class CompatibilitySynthesisInput:
 
     model: str
     voice_id: str | None
+    voice_style: str
     text: str
     reference_text: str | None
     language: str
@@ -75,6 +76,7 @@ async def parse_compatibility_request(request: Request) -> CompatibilitySynthesi
     return CompatibilitySynthesisInput(
         model=_string(values.get("model"), "f5-tts"),
         voice_id=_string(values.get("voice_id")) or None,
+        voice_style=_string(values.get("voice_style"), _string(values.get("style"), "tu_nhien")) or "tu_nhien",
         text=_string(values.get("text")),
         reference_text=_string(values.get("reference_text"))
         or _string(values.get("reference_transcript"))

@@ -23,6 +23,7 @@ from .voice_clone import (
     is_loopback_voice_clone_endpoint,
     synthesize_voice_clone_audio,
 )
+from .vieneu_tts import synthesize_vieneu_audio
 
 
 @dataclass(frozen=True)
@@ -300,10 +301,11 @@ def synthesize_scene_audio(
     voice_engine: str = "edge",
     voice_id: str = "vi-VN-HoaiMyNeural",
     voice_rate: str = "+0%",
+    vieneu_style: str = "tu_nhien",
     voice_clone_config: VoiceCloneConfig | None = None,
     uploaded_audio: AudioAsset | None = None,
 ) -> Path | None:
-    """Chuẩn bị audio cho một cảnh từ TTS, clone giọng hoặc bản thu thật."""
+    """Chuẩn bị audio cho một cảnh từ TTS local, clone giọng hoặc bản thu thật."""
 
     output_path = Path(output_path)
     if voice_engine == "uploaded":
@@ -326,6 +328,13 @@ def synthesize_scene_audio(
         if is_loopback_voice_clone_endpoint(voice_clone_config.endpoint):
             output_path = output_path.with_suffix(".wav")
         return synthesize_voice_clone_audio(text, output_path, config=voice_clone_config)
+    if voice_engine == "vieneu":
+        return synthesize_vieneu_audio(
+            text,
+            output_path.with_suffix(".wav"),
+            voice=voice_id,
+            style=vieneu_style,
+        )
     if voice_engine == "edge":
         return synthesize_edge_tts_audio(
             [scene], output_path, voice=voice_id, rate=voice_rate
@@ -365,48 +374,244 @@ def export_video(
 
 
 def _srt_timestamp(seconds: float) -> str:
-    milliseconds = int(round((seconds - int(seconds)) * 1000))
-    total_seconds = int(seconds)
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    secs = total_seconds % 60
+    total_milliseconds = max(0, int(round(float(seconds) * 1000)))
+    total_seconds, milliseconds = divmod(total_milliseconds, 1000)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
     return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
 
 
-def _subtitle_text(text: str, max_chars: int = 82, max_lines: int = 2) -> str:
-    words = re.sub(r"\s+", " ", text).strip().split()
-    if not words:
-        return ""
+def _subtitle_words(text: str) -> list[str]:
+    return re.sub(r"\s+", " ", str(text or "")).strip().split()
+
+
+def _subtitle_lines(words: Sequence[str], max_chars: int, max_lines: int) -> list[str]:
     lines: list[str] = []
     current = ""
     for word in words:
         candidate = word if not current else f"{current} {word}"
-        if len(candidate) <= max_chars:
+        if len(candidate) <= max_chars or not current:
             current = candidate
         else:
-            if current:
-                lines.append(current)
+            lines.append(current)
             current = word
-        if len(lines) >= max_lines:
-            break
-    if len(lines) < max_lines and current:
+    if current:
         lines.append(current)
-    return "\n".join(lines[:max_lines])
+    return lines
 
 
-def build_srt(scenes: Sequence[VideoScene], durations: Sequence[float], *, max_chars: int = 82) -> str:
+def _subtitle_text(text: str, max_chars: int = 82, max_lines: int = 2) -> str:
+    return "\n".join(_subtitle_lines(_subtitle_words(text), max_chars, max_lines)[:max_lines])
+
+
+def _subtitle_word_end_times(words: Sequence[str], duration: float) -> list[float]:
+    """Estimate word timings from text when the TTS engine has no alignment API."""
+
+    if not words:
+        return []
+    safe_duration = max(0.05, float(duration))
+    weights = []
+    for word in words:
+        letters = len(re.sub(r"[^\wÀ-ỹ]", "", word, flags=re.UNICODE))
+        punctuation_pauses = len(re.findall(r"[,.;:!?…]", word))
+        weights.append(max(1, letters) + punctuation_pauses * 2.5)
+    total_weight = sum(weights) or 1.0
+    elapsed = 0.0
+    ends: list[float] = []
+    for weight in weights:
+        elapsed += safe_duration * weight / total_weight
+        ends.append(min(safe_duration, elapsed))
+    return ends
+
+
+def _subtitle_window_text(
+    words: Sequence[str],
+    *,
+    max_chars: int = 74,
+    max_lines: int = 2,
+) -> str:
+    """Keep the newest spoken words visible in the two-line burned caption."""
+
+    if not words:
+        return ""
+    selected: list[str] = []
+    for word in reversed(words):
+        candidate = [word, *selected]
+        if selected and len(_subtitle_lines(candidate, max_chars, max_lines)) > max_lines:
+            break
+        selected = candidate
+    return "\n".join(_subtitle_lines(selected, max_chars, max_lines)[:max_lines])
+
+
+def _subtitle_chunks(
+    words: Sequence[str],
+    *,
+    max_chars: int = 74,
+    max_lines: int = 2,
+    max_words: int = 8,
+) -> list[list[str]]:
+    """Split narration into short karaoke windows instead of one long scroll."""
+
+    safe_max_lines = max(1, int(max_lines))
+    safe_max_words = max(1, int(max_words))
+    chunks: list[list[str]] = []
+    current: list[str] = []
+
+    for word in words:
+        candidate = [*current, word]
+        too_many_words = len(candidate) > safe_max_words
+        too_many_lines = (
+            bool(current)
+            and len(_subtitle_lines(candidate, max_chars, safe_max_lines)) > safe_max_lines
+        )
+        if current and (too_many_words or too_many_lines):
+            chunks.append(current)
+            current = [word]
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _subtitle_reveal_text(
+    text: str,
+    elapsed_seconds: float,
+    duration: float,
+    *,
+    max_chars: int = 74,
+    max_lines: int = 2,
+) -> str:
+    """Reveal a short karaoke window, then clear it after speech ends."""
+
+    words = _subtitle_words(text)
+    if not words:
+        return ""
+    safe_duration = max(0.05, float(duration))
+    elapsed = max(0.0, float(elapsed_seconds))
+    if elapsed > safe_duration:
+        return ""
+
+    ends = _subtitle_word_end_times(words, safe_duration)
+    visible_count = min(
+        len(words),
+        1 + sum(1 for end in ends[:-1] if elapsed >= end),
+    )
+    chunks = _subtitle_chunks(
+        words,
+        max_chars=max_chars,
+        max_lines=max_lines,
+    )
+
+    word_offset = 0
+    for chunk in chunks:
+        chunk_end = word_offset + len(chunk)
+        if visible_count <= chunk_end:
+            visible_in_chunk = max(1, visible_count - word_offset)
+            return "\n".join(
+                _subtitle_lines(
+                    chunk[:visible_in_chunk],
+                    max_chars,
+                    max_lines,
+                )[:max_lines]
+            )
+        word_offset = chunk_end
+
+    return "\n".join(_subtitle_lines(chunks[-1], max_chars, max_lines)[:max_lines])
+
+
+def _progressive_subtitle_entries(
+    text: str,
+    duration: float,
+    *,
+    max_chars: int = 82,
+    max_lines: int = 2,
+) -> list[tuple[float, float, str]]:
+    words = _subtitle_words(text)
+    ends = _subtitle_word_end_times(words, duration)
+    entries: list[tuple[float, float, str]] = []
+    previous = 0.0
+    word_offset = 0
+    for chunk in _subtitle_chunks(
+        words,
+        max_chars=max_chars,
+        max_lines=max_lines,
+    ):
+        chunk_ends = ends[word_offset:word_offset + len(chunk)]
+        for local_index, end in enumerate(chunk_ends):
+            caption = "\n".join(
+                _subtitle_lines(
+                    chunk[:local_index + 1],
+                    max_chars,
+                    max_lines,
+                )[:max_lines]
+            )
+            if caption and end > previous:
+                entries.append((previous, end, caption))
+            previous = end
+        word_offset += len(chunk)
+    return entries
+
+
+def build_srt(
+    scenes: Sequence[VideoScene],
+    durations: Sequence[float],
+    *,
+    audio_durations: Sequence[float | None] | None = None,
+    max_chars: int = 82,
+    progressive: bool = True,
+) -> str:
     entries: list[str] = []
     current = 0.0
     index = 1
-    for scene, duration in zip(scenes, durations):
+    for scene_index, (scene, duration) in enumerate(zip(scenes, durations)):
         if scene.subtitle_enabled and scene.narration.strip():
-            text = _subtitle_text(scene.narration, max_chars=max_chars)
-            entries.append(
-                f"{index}\n{_srt_timestamp(current)} --> {_srt_timestamp(current + duration)}\n{text}\n"
+            audio_duration = (
+                audio_durations[scene_index]
+                if audio_durations is not None and scene_index < len(audio_durations)
+                else None
             )
-            index += 1
+            speech_duration = (
+                min(float(duration), float(audio_duration))
+                if audio_duration and audio_duration > 0
+                else float(duration)
+            )
+            if progressive:
+                subtitle_entries = _progressive_subtitle_entries(
+                    scene.narration,
+                    speech_duration,
+                    max_chars=max_chars,
+                )
+            else:
+                subtitle_entries = [(0.0, float(duration), _subtitle_text(scene.narration, max_chars=max_chars))]
+            for start, end, text in subtitle_entries:
+                entries.append(
+                    f"{index}\n{_srt_timestamp(current + start)} --> "
+                    f"{_srt_timestamp(current + end)}\n{text}\n"
+                )
+                index += 1
         current += duration
     return "\n".join(entries)
+
+
+def _subtitle_rgb(
+    value: str | Sequence[int],
+    fallback: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    """Convert a color-picker value to an RGB tuple without breaking exports."""
+
+    if isinstance(value, (tuple, list)) and len(value) >= 3:
+        try:
+            return tuple(max(0, min(255, int(channel))) for channel in value[:3])  # type: ignore[return-value]
+        except (TypeError, ValueError):
+            return fallback
+    raw = str(value or "").strip().lstrip("#")
+    if len(raw) == 3:
+        raw = "".join(char * 2 for char in raw)
+    if len(raw) >= 6 and re.fullmatch(r"[0-9a-fA-F]{6}", raw[:6]):
+        return tuple(int(raw[index:index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+    return fallback
 
 
 def _draw_subtitle(
@@ -416,6 +621,13 @@ def _draw_subtitle(
     position: str = "Dưới",
     font_size: int = 28,
     max_lines: int = 2,
+    elapsed_seconds: float = 0.0,
+    reveal_duration: float | None = None,
+    progressive: bool = True,
+    background_color: str | Sequence[int] = "#000000",
+    text_color: str | Sequence[int] = "#FFFFFF",
+    box_width_percent: int = 85,
+    alignment: str = "Canh giữa",
 ) -> Image.Image:
     if not text.strip():
         return image
@@ -423,18 +635,69 @@ def _draw_subtitle(
     img = image.copy()
     draw = ImageDraw.Draw(img, "RGBA")
     font = _font(font_size, bold=True)
-    subtitle = _subtitle_text(text, max_chars=74, max_lines=max_lines)
+    try:
+        width_percent = max(20, min(100, int(box_width_percent)))
+    except (TypeError, ValueError):
+        width_percent = 85
+    side_margin = max(18, img.width // 36)
+    box_width = max(120, int(img.width * width_percent / 100))
+    if alignment in {"Góc trái", "Canh trái", "Trái"}:
+        x1 = side_margin
+        box_width = min(box_width, img.width - side_margin)
+    elif alignment in {"Góc phải", "Canh phải", "Phải"}:
+        box_width = min(box_width, img.width - side_margin)
+        x1 = img.width - box_width - side_margin
+    else:
+        box_width = min(box_width, img.width)
+        x1 = (img.width - box_width) // 2
+    x2 = x1 + box_width
+    horizontal_padding = max(16, font_size)
+    max_chars = max(
+        1,
+        min(
+            54,
+            int((box_width - horizontal_padding * 2) / max(1.0, font_size * 0.62)),
+        ),
+    )
+    subtitle = (
+        _subtitle_reveal_text(
+            text,
+            elapsed_seconds,
+            reveal_duration or 0.0,
+            max_chars=max_chars,
+            max_lines=max_lines,
+        )
+        if progressive
+        else _subtitle_text(text, max_chars=max_chars, max_lines=max_lines)
+    )
+    # Hết lời thì bỏ cả chữ và nền, không để lại một khung đen rỗng trong
+    # khoảng nghỉ cuối slide.
+    if not subtitle.strip():
+        return img
     lines = subtitle.splitlines()
     line_height = font_size + 8
-    box_height = line_height * len(lines) + 28
+    reserved_lines = max(1, int(max_lines))
+    # Giữ chiều cao cố định để khung không nhảy lên khi từ dòng 1 sang dòng 2.
+    box_height = line_height * reserved_lines + 28
     y = img.height - box_height - 36 if position == "Dưới" else (img.height - box_height) // 2
-    x1, x2 = 96, img.width - 96
-    draw.rounded_rectangle((x1, y, x2, y + box_height), radius=8, fill=(0, 0, 0, 150))
-    text_y = y + 14
+    background_rgb = _subtitle_rgb(background_color, (0, 0, 0))
+    text_rgb = _subtitle_rgb(text_color, (255, 255, 255))
+    draw.rounded_rectangle(
+        (x1, y, x2, y + box_height),
+        radius=8,
+        fill=(*background_rgb, 150),
+    )
+    text_y = y + 14 + max(0, (reserved_lines - len(lines)) * line_height // 2)
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
-        text_x = (img.width - (bbox[2] - bbox[0])) // 2
-        draw.text((text_x, text_y), line, fill=(255, 255, 255, 255), font=font)
+        line_width = bbox[2] - bbox[0]
+        if alignment in {"Góc trái", "Canh trái", "Trái"}:
+            text_x = x1 + horizontal_padding
+        elif alignment in {"Góc phải", "Canh phải", "Phải"}:
+            text_x = x2 - horizontal_padding - line_width
+        else:
+            text_x = x1 + (box_width - line_width) // 2
+        draw.text((text_x, text_y), line, fill=(*text_rgb, 255), font=font)
         text_y += line_height
     return img
 
@@ -546,6 +809,13 @@ def _write_segment_video(
     subtitle_position: str,
     subtitle_font_size: int,
     subtitle_max_lines: int,
+    subtitle_audio_duration: float | None = None,
+    subtitle_progressive: bool = True,
+    subtitle_background_color: str | Sequence[int] = "#000000",
+    subtitle_text_color: str | Sequence[int] = "#FFFFFF",
+    subtitle_box_width_percent: int = 85,
+    subtitle_alignment: str = "Canh giữa",
+    preserve_original_slide: bool = True,
     avatar_image: Image.Image | None = None,
     avatar_position: str = "Dưới phải",
     avatar_size_percent: int = 18,
@@ -564,8 +834,11 @@ def _write_segment_video(
         with imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8) as writer:
             for frame_index in range(total_frames):
                 progress = frame_index / max(1, total_frames - 1)
-                frame = _zoom_frame(base, progress)
-                frame = _fade_frame(frame, frame_index, total_frames, fade_frames)
+                if preserve_original_slide:
+                    frame = base.copy()
+                else:
+                    frame = _zoom_frame(base, progress)
+                    frame = _fade_frame(frame, frame_index, total_frames, fade_frames)
                 current_avatar = avatar_image
                 if avatar_iterator is not None:
                     try:
@@ -588,6 +861,13 @@ def _write_segment_video(
                         position=subtitle_position,
                         font_size=subtitle_font_size,
                         max_lines=subtitle_max_lines,
+                        elapsed_seconds=frame_index / max(1, fps),
+                        reveal_duration=subtitle_audio_duration or duration,
+                        progressive=subtitle_progressive,
+                        background_color=subtitle_background_color,
+                        text_color=subtitle_text_color,
+                        box_width_percent=subtitle_box_width_percent,
+                        alignment=subtitle_alignment,
                     )
                 writer.append_data(np.asarray(frame))
     finally:
@@ -639,6 +919,7 @@ def export_storyboard_video(
     voice_engine: str = "edge",
     voice_id: str = "vi-VN-HoaiMyNeural",
     voice_rate: str = "+0%",
+    vieneu_style: str = "tu_nhien",
     voice_clone_config: VoiceCloneConfig | None = None,
     scene_audio_assets: Sequence[AudioAsset | None] | None = None,
     slide_images: Sequence[Image.Image] | None = None,
@@ -646,6 +927,12 @@ def export_storyboard_video(
     subtitle_position: str = "Dưới",
     subtitle_font_size: int = 28,
     subtitle_max_lines: int = 2,
+    subtitle_progressive: bool = True,
+    subtitle_background_color: str | Sequence[int] = "#000000",
+    subtitle_text_color: str | Sequence[int] = "#FFFFFF",
+    subtitle_box_width_percent: int = 85,
+    subtitle_alignment: str = "Canh giữa",
+    preserve_original_slide: bool = True,
     pause_after: float = 0.35,
     srt_path: str | Path | None = None,
     avatar_image: Image.Image | None = None,
@@ -682,6 +969,7 @@ def export_storyboard_video(
             avatar_image.convert("RGB").save(avatar_source_path)
         segment_paths: list[Path] = []
         durations: list[float] = []
+        subtitle_audio_durations: list[float | None] = []
 
         active_local_videos = [video for scene, video in zip(scenes, local_avatar_videos or [None] * len(scenes)) if not scene.skip] if local_avatar_videos is not None else [None] * len(active_scenes)
         active_audio_assets = [asset for scene, asset in zip(scenes, scene_audio_assets or [None] * len(scenes)) if not scene.skip] if scene_audio_assets is not None else [None] * len(active_scenes)
@@ -695,6 +983,7 @@ def export_storyboard_video(
                     voice_engine=voice_engine,
                     voice_id=voice_id,
                     voice_rate=voice_rate,
+                    vieneu_style=vieneu_style,
                     voice_clone_config=voice_clone_config,
                     uploaded_audio=uploaded_audio,
                 )
@@ -702,6 +991,7 @@ def export_storyboard_video(
             audio_duration = _media_duration(audio_path) if audio_path else None
             duration = max(2.2, (audio_duration or len(scene.narration) / 13.0 or 4.0) + scene.pause_after + pause_after)
             durations.append(duration)
+            subtitle_audio_durations.append(audio_duration)
 
             ai_avatar_video_path: Path | None = None
             if local_video_bytes:
@@ -726,6 +1016,13 @@ def export_storyboard_video(
                 subtitle_position=subtitle_position,
                 subtitle_font_size=subtitle_font_size,
                 subtitle_max_lines=subtitle_max_lines,
+                subtitle_audio_duration=audio_duration,
+                subtitle_progressive=subtitle_progressive,
+                subtitle_background_color=subtitle_background_color,
+                subtitle_text_color=subtitle_text_color,
+                subtitle_box_width_percent=subtitle_box_width_percent,
+                subtitle_alignment=subtitle_alignment,
+                preserve_original_slide=preserve_original_slide,
                 avatar_image=avatar_image,
                 avatar_position=avatar_position,
                 avatar_size_percent=avatar_size_percent,
@@ -761,7 +1058,12 @@ def export_storyboard_video(
                 segment_path = silent_segment
             segment_paths.append(segment_path)
 
-        srt_text = build_srt(active_scenes, durations)
+        srt_text = build_srt(
+            active_scenes,
+            durations,
+            audio_durations=subtitle_audio_durations,
+            progressive=subtitle_progressive,
+        )
         written_srt_path = Path(srt_path) if srt_path else None
         if written_srt_path:
             written_srt_path.parent.mkdir(parents=True, exist_ok=True)

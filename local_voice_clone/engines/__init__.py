@@ -3,6 +3,7 @@ from pathlib import Path
 from .base import EngineUnavailableError, VoiceCloneEngine
 from .dummy_engine import DummyVoiceCloneEngine
 from .f5_tts_engine import F5TTSEngine
+from .vieneu_tts_engine import VieneuTTSEngine
 
 
 def create_engine(
@@ -31,12 +32,15 @@ def create_engine(
 
         return ViraTTSEngine(device=device)
 
+    if normalized in {"vieneu", "vieneu-tts", "vieneu_tts"}:
+        return VieneuTTSEngine(device=device)
+
     if normalized == "dummy":
         return DummyVoiceCloneEngine(device=device)
 
     raise EngineUnavailableError(
         f"Engine '{name}' chưa được hỗ trợ. "
-        "Dùng f5-tts, vira-tts hoặc dummy."
+        "Dùng f5-tts, vira-tts, vieneu hoặc dummy."
     )
 
 
@@ -45,5 +49,6 @@ __all__ = [
     "VoiceCloneEngine",
     "DummyVoiceCloneEngine",
     "F5TTSEngine",
+    "VieneuTTSEngine",
     "create_engine",
 ]

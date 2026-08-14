@@ -8,8 +8,8 @@ transcript hay narration lên cloud.
 storyboard.xlsx -> Voice Clone :8009 -> WAV -> OpenAvatar/Wav2Lip :8008 -> video
 ```
 
-Engine production là F5-TTS. Engine `dummy` chỉ tạo âm kiểm thử cho API/cache/
-storyboard, không đọc và không clone giọng nói.
+Engine production gồm F5-TTS và VieNeu-TTS preset voice. Engine `dummy` chỉ tạo
+âm kiểm thử cho API/cache/storyboard, không đọc và không clone giọng nói.
 
 ## Quyền dùng giọng
 
@@ -42,6 +42,17 @@ thức của PyTorch. Không hard-code một CUDA wheel không phù hợp GPU. C
 .\.venv\Scripts\activate
 pip install -r requirements-f5.txt
 ```
+
+VieNeu-TTS dùng giọng preset, không cần `reference_audio`:
+
+```powershell
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Chọn `model=vieneu` và `voice_id` preset trong API. Danh sách preset được trả
+bởi `GET /v1/vieneu/voices`; model chỉ được nạp khi endpoint này hoặc endpoint
+synthesis được gọi lần đầu.
 
 Lấy checkpoint theo [F5-TTS chính thức](https://github.com/SWivid/F5-TTS) khi
 bạn chủ động cho phép Internet. Mặc định `ALLOW_MODEL_DOWNLOAD=false`, nên
@@ -101,6 +112,12 @@ Invoke-RestMethod http://127.0.0.1:8009/v1/voices
 Nếu `LOCAL_API_KEY` được đặt, thêm `Authorization: Bearer <key>`. Khi để trống,
 auth tắt mặc định.
 
+Khi chạy `start_f5_8009.bat`, service bật cả `LOCAL_API_KEY` và
+`VOICE_UPLOAD_PASSWORD`. Trong Streamlit, nhập đúng hai giá trị tương ứng ở
+hai ô **LOCAL_API_KEY của service 8009** và **Mật khẩu Local Voice Clone
+(8009)**. Không dùng mật khẩu mở khóa upload của Streamlit thay cho API key;
+nếu thiếu API key, request tạo audio sẽ trả `HTTP 401`.
+
 ### JSON với profile đã đăng ký
 
 ```powershell
@@ -125,7 +142,9 @@ bit là default/khuyến nghị cho Wav2Lip; MP3 là 192 kbps.
 
 `/v1/voice-clone/synthesize` và `/v1/voice-clone/synthesize-upload` đều nhận
 multipart fields: `model`, `text`, `reference_audio`, `reference_text` hoặc
-`reference_transcript`, `output_format`, `voice_use_consent`.
+`reference_transcript`, `voice_style`, `output_format`, `voice_use_consent`.
+Với `model=vieneu`, `reference_audio` và consent không cần thiết; gửi thêm
+`voice_id` và `voice_style` (`tu_nhien`, `tin_tuc` hoặc `doc_truyen`).
 
 ```powershell
 $headers = @{ "X-Voice-Upload-Password" = "<mật khẩu upload>" }

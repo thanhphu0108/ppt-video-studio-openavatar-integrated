@@ -55,3 +55,13 @@ local_voice_clone/logs/
 local_voice_clone/tmp/
 /local_voice_clone
 /local_voice_clone
+
+# VieNeu integration is source code, not local runtime data.
+!/local_voice_clone/
+/local_voice_clone/*
+!/local_voice_clone/engines/
+/local_voice_clone/engines/*
+!/local_voice_clone/engines/vieneu_tts_engine.py
+!/local_voice_clone/tests/
+/local_voice_clone/tests/*
+!/local_voice_clone/tests/test_vieneu.py

@@ -78,6 +78,8 @@ class SynthesisService:
         raw = (model or (profile.engine if profile else default_engine) or default_engine).strip().lower()
         if raw in {"f5-tts", "f5tts", "f5_tts", "f5tts_v1_base", "f5-tts-v1-base"}:
             return "f5-tts"
+        if raw in {"vieneu", "vieneu-tts", "vieneu_tts"}:
+            return "vieneu"
         return raw
 
     def engine(self, name: str) -> VoiceCloneEngine:
@@ -128,7 +130,7 @@ class SynthesisService:
 
     def model_infos(self) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
-        for name in ("f5-tts", "dummy"):
+        for name in ("f5-tts", "vieneu", "dummy"):
             try:
                 engine = self.engine(name)
                 info = engine.model_info()
@@ -208,6 +210,43 @@ class SynthesisService:
             paragraph_after=[marker for _, marker in chunks],
         )
 
+    def _render_vieneu_chunks(
+        self,
+        *,
+        engine: VoiceCloneEngine,
+        chunks: list[tuple[str, bool]],
+        voice_id: str,
+        style: str,
+        language: str,
+        speed: float,
+        temporary_dir: Path,
+    ) -> Path:
+        synthesize_with_voice = getattr(engine, "synthesize_with_voice", None)
+        if not callable(synthesize_with_voice):
+            raise RuntimeError("VieNeu engine không hỗ trợ preset voice.")
+
+        paths: list[Path] = []
+        for index, (chunk, _) in enumerate(chunks, start=1):
+            target = temporary_dir / f"chunk_{index:03}.wav"
+            synthesize_with_voice(
+                text=chunk,
+                voice_id=voice_id or None,
+                style=style,
+                output_path=target,
+                language=language,
+                speed=speed,
+            )
+            if not target.exists() or target.stat().st_size == 0:
+                raise RuntimeError(f"VieNeu-TTS không sinh được chunk {index}.")
+            paths.append(target)
+        return self.audio.concatenate_wavs(
+            paths,
+            temporary_dir / "combined.wav",
+            sentence_pause_ms=self.settings.sentence_pause_ms,
+            paragraph_pause_ms=self.settings.paragraph_pause_ms,
+            paragraph_after=[marker for _, marker in chunks],
+        )
+
     @staticmethod
     def _is_oom(error: Exception) -> bool:
         message = str(error).lower()
@@ -223,6 +262,161 @@ class SynthesisService:
         except ImportError:
             pass
 
+    def _synthesize_vieneu(
+        self,
+        *,
+        normalized_text: str,
+        voice_id: str | None,
+        voice_style: str,
+        language: str,
+        speed: float,
+        selected_format: str,
+        output_dir: str | Path | None,
+        output_name: str | None,
+    ) -> SynthesisResult:
+        """Synthesize a preset voice without touching reference-profile code."""
+
+        selected_engine = "vieneu"
+        effective_voice_id = voice_id or "default"
+        effective_style = (voice_style or "tu_nhien").strip() or "tu_nhien"
+        effective_language = language or "vi"
+        request_id = str(uuid.uuid4())
+        destination_dir = Path(output_dir).resolve() if output_dir else self.settings.output_dir.resolve()
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = self._safe_output_path(destination_dir, output_name or request_id, selected_format)
+        warnings: list[str] = []
+        started_at = time.perf_counter()
+
+        try:
+            with self._inference_lock:
+                engine = self.engine(selected_engine)
+                engine.load()
+        except EngineUnavailableError as exc:
+            raise VoiceCloneServiceError("MODEL_NOT_LOADED", str(exc), status_code=503) from exc
+        except Exception as exc:
+            raise VoiceCloneServiceError("MODEL_NOT_LOADED", f"Không tải được VieNeu-TTS: {exc}", status_code=503) from exc
+
+        temporary_dir = Path(tempfile.mkdtemp(prefix="vieneu_", dir=self.settings.temp_dir))
+        try:
+            cache_key = self.cache.build_key(
+                {
+                    "engine": selected_engine,
+                    "voice_id": effective_voice_id,
+                    "voice_style": effective_style,
+                    "text": normalized_text,
+                    "language": effective_language,
+                    "speed": float(speed),
+                    "output_format": selected_format,
+                    "service_version": "1.0.0-vieneu",
+                }
+            )
+            cached_metadata = self.cache.restore(cache_key, selected_format, destination)
+            if cached_metadata is not None:
+                elapsed = time.perf_counter() - started_at
+                return SynthesisResult(
+                    request_id=request_id,
+                    model=selected_engine,
+                    voice_id=effective_voice_id,
+                    audio_path=destination,
+                    output_format=selected_format,
+                    duration_seconds=float(cached_metadata.get("duration_seconds", 0.0)),
+                    sample_rate=int(cached_metadata.get("sample_rate", self.settings.output_sample_rate)),
+                    warnings=list(dict.fromkeys(warnings + list(cached_metadata.get("warnings", [])))),
+                    cache_hit=True,
+                    inference_seconds=0.0,
+                    normalized_text=normalized_text,
+                    queue_wait_seconds=0.0,
+                    total_seconds=elapsed,
+                )
+
+            chunks = chunk_text(normalized_text, self.settings.max_chars_per_chunk)
+            if not chunks:
+                raise VoiceCloneServiceError("TEXT_EMPTY", "Không tách được text thành chunk.")
+
+            queue_started = time.perf_counter()
+            with self._inference_lock:
+                queue_wait_seconds = time.perf_counter() - queue_started
+                inference_started = time.perf_counter()
+                try:
+                    generated_wav = self._render_vieneu_chunks(
+                        engine=engine,
+                        chunks=chunks,
+                        voice_id=voice_id or "",
+                        style=effective_style,
+                        language=effective_language,
+                        speed=float(speed),
+                        temporary_dir=temporary_dir,
+                    )
+                except Exception as exc:
+                    if not self._is_oom(exc):
+                        raise
+                    self._clear_cuda_cache()
+                    smaller_chunks = chunk_text(
+                        normalized_text,
+                        max(50, self.settings.max_chars_per_chunk // 2),
+                    )
+                    try:
+                        generated_wav = self._render_vieneu_chunks(
+                            engine=engine,
+                            chunks=smaller_chunks,
+                            voice_id=voice_id or "",
+                            style=effective_style,
+                            language=effective_language,
+                            speed=float(speed),
+                            temporary_dir=temporary_dir / "oom_retry",
+                        )
+                        warnings.append("GPU_OOM_RETRIED_WITH_SMALLER_CHUNKS")
+                    except Exception as retry_exc:
+                        raise VoiceCloneServiceError(
+                            "GPU_OUT_OF_MEMORY",
+                            f"GPU hết bộ nhớ sau lần thử lại: {retry_exc}",
+                            status_code=503,
+                        ) from retry_exc
+                inference_seconds = time.perf_counter() - inference_started
+
+            inspection: AudioInspection = self.audio.inspect(generated_wav)
+            warnings.extend(self.audio.quality_warnings(inspection))
+            if selected_format == "wav":
+                shutil.copyfile(generated_wav, destination)
+            else:
+                self.audio.convert_to_mp3(generated_wav, destination)
+            if not destination.exists() or destination.stat().st_size == 0:
+                raise VoiceCloneServiceError("MODEL_INFERENCE_ERROR", "Không ghi được output audio.", status_code=500)
+
+            total_seconds = time.perf_counter() - started_at
+            metadata = {
+                "duration_seconds": inspection.duration_seconds,
+                "sample_rate": inspection.sample_rate,
+                "warnings": list(dict.fromkeys(warnings)),
+                "model": selected_engine,
+                "voice_id": effective_voice_id,
+                "voice_style": effective_style,
+                "output_format": selected_format,
+            }
+            self.cache.store(cache_key, selected_format, destination, metadata)
+            return SynthesisResult(
+                request_id=request_id,
+                model=selected_engine,
+                voice_id=effective_voice_id,
+                audio_path=destination,
+                output_format=selected_format,
+                duration_seconds=inspection.duration_seconds,
+                sample_rate=inspection.sample_rate,
+                warnings=list(dict.fromkeys(warnings)),
+                cache_hit=False,
+                inference_seconds=inference_seconds,
+                normalized_text=normalized_text,
+                queue_wait_seconds=queue_wait_seconds,
+                total_seconds=total_seconds,
+            )
+        except VoiceCloneServiceError:
+            raise
+        except Exception as exc:
+            self.logger.exception("vieneu_synthesis_failed voice_id=%s error=%s", effective_voice_id, exc)
+            raise VoiceCloneServiceError("MODEL_INFERENCE_ERROR", f"VieNeu-TTS inference lỗi: {exc}", status_code=500) from exc
+        finally:
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+
     def synthesize(
         self,
         *,
@@ -231,6 +425,7 @@ class SynthesisService:
         voice_id: str | None = None,
         reference_audio: str | Path | None = None,
         reference_text: str | None = None,
+        voice_style: str = "tu_nhien",
         language: str = "vi",
         speed: float = 1.0,
         output_format: str = "wav",
@@ -248,6 +443,18 @@ class SynthesisService:
         normalized_text = self.normalizer.normalize(text)
         if not normalized_text:
             raise VoiceCloneServiceError("TEXT_EMPTY", "Text trống sau khi chuẩn hóa.")
+        requested_engine = self._engine_key(model, None, self.settings.engine)
+        if requested_engine == "vieneu":
+            return self._synthesize_vieneu(
+                normalized_text=normalized_text,
+                voice_id=voice_id,
+                voice_style=voice_style,
+                language=language,
+                speed=float(speed),
+                selected_format=selected_format,
+                output_dir=output_dir,
+                output_name=output_name,
+            )
         profile, source_reference, effective_reference_text, effective_language, effective_voice_id = self._profile_or_reference(
             voice_id=voice_id,
             reference_audio=reference_audio,

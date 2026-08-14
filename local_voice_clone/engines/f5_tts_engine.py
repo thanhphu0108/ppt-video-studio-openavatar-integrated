@@ -69,6 +69,29 @@ class F5TTSEngine(VoiceCloneEngine):
             )
         ).resolve()
 
+        # F5-TTS performance profile.
+        # Defaults target a practical FAST mode for GTX 1070 Ti while keeping
+        # quality substantially above ultra-low-step settings.
+        self.nfe_step = max(4, int(os.getenv("F5_NFE_STEP", "16")))
+        self.cfg_strength = float(os.getenv("F5_CFG_STRENGTH", "2.0"))
+        self.sway_sampling_coef = float(
+            os.getenv("F5_SWAY_SAMPLING_COEF", "-1.0")
+        )
+        self.cross_fade_duration = max(
+            0.0,
+            float(os.getenv("F5_CROSS_FADE_DURATION", "0.15")),
+        )
+        self.remove_silence = (
+            os.getenv("F5_REMOVE_SILENCE", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.target_rms = float(os.getenv("F5_TARGET_RMS", "0.1"))
+        self.seed = (
+            int(os.getenv("F5_SEED"))
+            if os.getenv("F5_SEED", "").strip()
+            else None
+        )
+
         self._model: Any | None = None
         self._error = ""
         self._resolved_device = device
@@ -274,7 +297,11 @@ class F5TTSEngine(VoiceCloneEngine):
                 model=self.model_name,
                 message=(
                     f"checkpoint={self.ckpt_file.name}; "
-                    f"vocab={self.vocab_file.name}"
+                    f"vocab={self.vocab_file.name}; "
+                    f"nfe_step={self.nfe_step}; "
+                    f"cfg_strength={self.cfg_strength}; "
+                    f"sway={self.sway_sampling_coef}; "
+                    f"cross_fade={self.cross_fade_duration}"
                 ),
             )
 
@@ -363,14 +390,42 @@ class F5TTSEngine(VoiceCloneEngine):
 
         if "speed" in signature.parameters:
             kwargs["speed"] = speed
+
+        # Bind only parameters supported by the installed F5-TTS version.
+        if "nfe_step" in signature.parameters:
+            kwargs["nfe_step"] = self.nfe_step
+        if "cfg_strength" in signature.parameters:
+            kwargs["cfg_strength"] = self.cfg_strength
+        if "sway_sampling_coef" in signature.parameters:
+            kwargs["sway_sampling_coef"] = self.sway_sampling_coef
+        if "cross_fade_duration" in signature.parameters:
+            kwargs["cross_fade_duration"] = self.cross_fade_duration
+        if "remove_silence" in signature.parameters:
+            kwargs["remove_silence"] = self.remove_silence
+        if "target_rms" in signature.parameters:
+            kwargs["target_rms"] = self.target_rms
+        if "seed" in signature.parameters and self.seed is not None:
+            kwargs["seed"] = self.seed
+
         if "language" in signature.parameters:
             kwargs["language"] = language
         if "show_info" in signature.parameters:
             kwargs["show_info"] = lambda *_args, **_kwargs: None
 
         try:
+            import time as _time
+
+            _started = _time.perf_counter()
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 result = infer(**kwargs)
+            _elapsed = _time.perf_counter() - _started
+            print(
+                f"[F5-TTS] infer chars={len(text)} "
+                f"nfe_step={self.nfe_step} "
+                f"time={_elapsed:.2f}s "
+                f"device={self._resolved_device}",
+                flush=True,
+            )
         except Exception as exc:
             self._error = f"F5-TTS inference lỗi: {exc}"
             raise

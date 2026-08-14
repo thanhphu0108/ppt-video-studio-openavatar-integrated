@@ -24,6 +24,7 @@ class VoiceCloneConfig:
     reference_audio: bytes
     reference_filename: str
     model: str = "default"
+    voice_region: str = "auto"
     api_key: str = ""
     reference_transcript: str = ""
     voice_use_consent: bool = False
@@ -121,6 +122,7 @@ def synthesize_voice_clone_audio(
     data = {
         "text": narration,
         "model": config.model.strip() or "default",
+        "voice_region": config.voice_region.strip().lower() or "auto",
         "reference_transcript": config.reference_transcript.strip(),
         "output_format": output_format,
         "voice_use_consent": "true" if config.voice_use_consent else "false",

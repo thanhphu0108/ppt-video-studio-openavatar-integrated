@@ -65,3 +65,6 @@ local_voice_clone/tmp/
 !/local_voice_clone/tests/
 /local_voice_clone/tests/*
 !/local_voice_clone/tests/test_vieneu.py
+!/local_voice_clone/start_vieneu_clone_8009.bat
+!/local_voice_clone/start_vieneu_clone_8009_background.bat
+!/local_voice_clone/start_vieneu_clone_8009_background.ps1

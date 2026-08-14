@@ -8,8 +8,9 @@ transcript hay narration lên cloud.
 storyboard.xlsx -> Voice Clone :8009 -> WAV -> OpenAvatar/Wav2Lip :8008 -> video
 ```
 
-Engine production gồm F5-TTS và VieNeu-TTS preset voice. Engine `dummy` chỉ tạo
-âm kiểm thử cho API/cache/storyboard, không đọc và không clone giọng nói.
+Engine production gồm F5-TTS (checkpoint mặc định Trung/Anh), Vira-TTS (clone
+tiếng Việt nhưng chậm hơn) và VieNeu-TTS v3 Turbo. Engine `dummy` chỉ tạo âm
+kiểm thử cho API/cache/storyboard, không đọc và không clone giọng nói.
 
 ## Quyền dùng giọng
 
@@ -43,16 +44,38 @@ thức của PyTorch. Không hard-code một CUDA wheel không phù hợp GPU. C
 pip install -r requirements-f5.txt
 ```
 
-VieNeu-TTS dùng giọng preset, không cần `reference_audio`:
+VieNeu-TTS hỗ trợ cả giọng preset và clone zero-shot từ mẫu tiếng Việt. Để dùng
+clone nhanh trên GPU, khởi động service riêng:
 
 ```powershell
 .\.venv\Scripts\activate
 pip install -r requirements.txt
+.\start_vieneu_clone_8009.bat
 ```
 
-Chọn `model=vieneu` và `voice_id` preset trong API. Danh sách preset được trả
-bởi `GET /v1/vieneu/voices`; model chỉ được nạp khi endpoint này hoặc endpoint
-synthesis được gọi lần đầu.
+Nếu không muốn giữ terminal/IDE ở trạng thái đang chạy service, dùng launcher
+nền; model sẽ nạp trong process ẩn và log nằm trong `logs/`:
+
+```powershell
+.\start_vieneu_clone_8009_background.bat
+```
+
+Script đặt `VOICE_ENGINE=vieneu` và `VIENEU_BACKEND=pytorch`, nạp model một lần
+rồi tái sử dụng cho các slide. Script cũng tự thêm FFmpeg `full-shared` local
+vào DLL path và dùng `soundfile` để đọc WAV mẫu, tránh lỗi TorchCodec trên
+Windows. Mẫu nên là WAV rõ tiếng, một người nói, khoảng
+3–8 giây; transcript không bắt buộc với VieNeu v3 Turbo. Nếu chỉ muốn giọng
+preset, chọn `model=vieneu` và `voice_id`; danh sách preset được trả bởi
+`GET /v1/vieneu/voices`.
+
+Clone có thêm `voice_region=auto|nam|bac|trung`. Với `nam`, `bac` hoặc `trung`,
+VieNeu giữ speaker embedding của file mẫu nhưng lấy reference codes từ prompt
+giọng vùng tương ứng. Đây là định hướng vùng của v3 Turbo, không phải bộ lọc
+âm thanh; mẫu sạch và đúng giọng mong muốn vẫn cho kết quả tự nhiên nhất.
+
+`f5-tts` không phải model tiếng Việt: checkpoint F5-TTS v1 Base hiện tại dành
+cho Trung/Anh. `vira-tts` đọc được tiếng Việt nhưng thường tốn thời gian hơn
+cho cùng một đoạn, nên không còn là lựa chọn mặc định cho clone.
 
 Lấy checkpoint theo [F5-TTS chính thức](https://github.com/SWivid/F5-TTS) khi
 bạn chủ động cho phép Internet. Mặc định `ALLOW_MODEL_DOWNLOAD=false`, nên
@@ -92,12 +115,13 @@ Chạy app PPT trên cùng máy rồi chọn `Nhân bản giọng từ mẫu (AP
 
 ```text
 Voice-clone API endpoint: http://127.0.0.1:8009/v1/voice-clone/synthesize
-Model:                    f5-tts
-API key:                  để trống
-Nội dung mẫu giọng:       transcript đúng với reference audio
+Model:                    vieneu-clone
+API key:                  123456 (theo start_vieneu_clone_8009.bat)
+Vùng giọng:               nam (Miền Nam), bac (Miền Bắc), trung (Miền Trung)
+Nội dung mẫu giọng:       có thể để trống với VieNeu v3 Turbo
 ```
 
-Form đã đặt endpoint/model này làm mặc định. Mật khẩu giọng upload chỉ được
+Form đã đặt `vieneu-clone` làm mặc định. Mật khẩu giọng upload chỉ được
 gửi tới hostname loopback, không bị gửi sang endpoint cloud. Nếu app Streamlit
 được host trên cloud, chạy app PPT local để Python gọi `127.0.0.1` được.
 
@@ -112,7 +136,7 @@ Invoke-RestMethod http://127.0.0.1:8009/v1/voices
 Nếu `LOCAL_API_KEY` được đặt, thêm `Authorization: Bearer <key>`. Khi để trống,
 auth tắt mặc định.
 
-Khi chạy `start_f5_8009.bat`, service bật cả `LOCAL_API_KEY` và
+Khi chạy `start_vieneu_clone_8009.bat`, service bật cả `LOCAL_API_KEY` và
 `VOICE_UPLOAD_PASSWORD`. Trong Streamlit, nhập đúng hai giá trị tương ứng ở
 hai ô **LOCAL_API_KEY của service 8009** và **Mật khẩu Local Voice Clone
 (8009)**. Không dùng mật khẩu mở khóa upload của Streamlit thay cho API key;
@@ -156,8 +180,8 @@ $form = @{
 Invoke-RestMethod -Uri "http://127.0.0.1:8009/v1/voice-clone/synthesize-upload" -Method Post -Headers $headers -Form $form
 ```
 
-Thiếu transcript sẽ có warning `REFERENCE_TRANSCRIPT_MISSING`; service không
-tự bịa transcript.
+Với F5, thiếu transcript sẽ có warning `REFERENCE_TRANSCRIPT_MISSING`; VieNeu
+v3 Turbo có thể clone từ file mẫu mà không cần transcript.
 
 ## Storyboard Excel
 

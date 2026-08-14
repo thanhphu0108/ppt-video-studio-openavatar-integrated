@@ -18,6 +18,7 @@ class CompatibilitySynthesisInput:
 
     model: str
     voice_id: str | None
+    voice_region: str
     voice_style: str
     text: str
     reference_text: str | None
@@ -73,9 +74,22 @@ async def parse_compatibility_request(request: Request) -> CompatibilitySynthesi
     output_format = _string(values.get("output_format"), "wav").lower().lstrip(".")
     if output_format not in {"wav", "mp3"}:
         raise HTTPException(status_code=422, detail="output_format chỉ có thể là wav hoặc mp3.")
+    voice_region = _string(
+        values.get("voice_region")
+        or values.get("region")
+        or values.get("dialect"),
+        "auto",
+    ).lower()
+    if voice_region not in {"auto", "nam", "bac", "trung"}:
+        raise HTTPException(
+            status_code=422,
+            detail="voice_region chỉ có thể là auto, nam, bac hoặc trung.",
+        )
+
     return CompatibilitySynthesisInput(
         model=_string(values.get("model"), "f5-tts"),
         voice_id=_string(values.get("voice_id")) or None,
+        voice_region=voice_region,
         voice_style=_string(values.get("voice_style"), _string(values.get("style"), "tu_nhien")) or "tu_nhien",
         text=_string(values.get("text")),
         reference_text=_string(values.get("reference_text"))

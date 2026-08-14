@@ -20,9 +20,18 @@ class _FakeVieNeu:
     def list_preset_voices(self):
         return [("Bắc — giọng nữ", "BacNu"), {"label": "Nam", "id": "Nam"}]
 
-    def infer(self, text, voice="", style=""):
-        self.infer_calls.append((text, voice, style))
+    def infer(self, text, voice="", style="", ref_audio=None, **kwargs):
+        self.infer_calls.append((text, voice, style, ref_audio, kwargs))
         return b"audio"
+
+    @staticmethod
+    def encode_reference(reference_audio):
+        return "user-speaker-embedding", "user-reference-codes"
+
+    @staticmethod
+    def get_preset_voice(name):
+        assert name == "Xuân Vĩnh"
+        return {"speaker_emb": "preset-speaker-embedding", "codes": "south-prompt-codes"}
 
     @staticmethod
     def save(audio, path):
@@ -59,6 +68,45 @@ def test_vieneu_missing_package_has_actionable_error(tmp_path):
     ):
         with pytest.raises(VieNeuUnavailableError, match="pip install vieneu"):
             synthesize_vieneu_audio("Xin chào", tmp_path / "speech.wav")
+
+
+def test_vieneu_clone_passes_reference_audio_to_sdk(tmp_path):
+    fake = _FakeVieNeu()
+    module = SimpleNamespace(Vieneu=lambda **kwargs: fake)
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"reference")
+
+    with patch("src.vieneu_tts.importlib.import_module", return_value=module):
+        result = synthesize_vieneu_audio(
+            "Xin chào Việt Nam",
+            tmp_path / "clone.wav",
+            reference_audio=reference,
+            reference_text="Xin chào Việt Nam",
+        )
+
+    assert result == tmp_path / "clone.wav"
+    assert fake.infer_calls[0][3] == str(reference.resolve())
+
+
+def test_vieneu_clone_region_keeps_user_embedding_and_uses_regional_prompt(tmp_path):
+    fake = _FakeVieNeu()
+    module = SimpleNamespace(Vieneu=lambda **kwargs: fake)
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"reference")
+
+    with patch("src.vieneu_tts.importlib.import_module", return_value=module):
+        result = synthesize_vieneu_audio(
+            "Xin chào miền Nam",
+            tmp_path / "clone_south.wav",
+            reference_audio=reference,
+            voice_region="nam",
+        )
+
+    assert result == tmp_path / "clone_south.wav"
+    _, selected_voice, _, reference_audio, _ = fake.infer_calls[0]
+    assert selected_voice["speaker_emb"] == "user-speaker-embedding"
+    assert selected_voice["codes"] == "south-prompt-codes"
+    assert reference_audio is None
 
 
 def test_video_export_routes_vieneu_style(tmp_path):

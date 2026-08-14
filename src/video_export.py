@@ -302,6 +302,7 @@ def synthesize_scene_audio(
     voice_id: str = "vi-VN-HoaiMyNeural",
     voice_rate: str = "+0%",
     vieneu_style: str = "tu_nhien",
+    voice_region: str = "auto",
     voice_clone_config: VoiceCloneConfig | None = None,
     uploaded_audio: AudioAsset | None = None,
 ) -> Path | None:
@@ -334,6 +335,7 @@ def synthesize_scene_audio(
             output_path.with_suffix(".wav"),
             voice=voice_id,
             style=vieneu_style,
+            voice_region=voice_region,
         )
     if voice_engine == "edge":
         return synthesize_edge_tts_audio(
@@ -920,6 +922,7 @@ def export_storyboard_video(
     voice_id: str = "vi-VN-HoaiMyNeural",
     voice_rate: str = "+0%",
     vieneu_style: str = "tu_nhien",
+    voice_region: str = "auto",
     voice_clone_config: VoiceCloneConfig | None = None,
     scene_audio_assets: Sequence[AudioAsset | None] | None = None,
     slide_images: Sequence[Image.Image] | None = None,
@@ -984,6 +987,7 @@ def export_storyboard_video(
                     voice_id=voice_id,
                     voice_rate=voice_rate,
                     vieneu_style=vieneu_style,
+                    voice_region=voice_region,
                     voice_clone_config=voice_clone_config,
                     uploaded_audio=uploaded_audio,
                 )

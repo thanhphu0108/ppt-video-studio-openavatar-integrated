@@ -38,8 +38,10 @@ from src.local_gpu_bridge import local_gpu_bridge, decode_video_result, decode_a
 from src.voice_clone import VoiceCloneConfig
 from src.voice_access import verify_voice_upload_password
 from src.vieneu_tts import (
+    SUPPORTED_VOICE_REGIONS as VIENEU_VOICE_REGIONS,
     SUPPORTED_STYLES as VIENEU_STYLES,
     list_vieneu_voices,
+    normalize_voice_region,
     vieneu_available,
     vieneu_install_hint,
 )
@@ -205,6 +207,7 @@ def reset_presentation_editing_state() -> None:
         "vieneu_voice_id",
         "vieneu_voice_id_fallback",
         "vieneu_style",
+        "voice_region",
     ):
         st.session_state.pop(key, None)
     st.session_state.intro_upload = None
@@ -255,7 +258,7 @@ def configured_voice_upload_password() -> str | None:
 def configured_voice_clone_api_key() -> str:
     """Read the token used by the local Voice Clone service, if configured.
 
-    ``start_f5_8009.bat`` names this token ``LOCAL_API_KEY`` while the
+    Local Voice Clone start scripts name this token ``LOCAL_API_KEY`` while the
     Streamlit UI uses the less ambiguous ``VOICE_CLONE_API_KEY`` name.  The
     latter wins so a deployment can keep its own secret namespace.
     """
@@ -288,6 +291,7 @@ def clear_voice_upload_session() -> None:
         "voice_clone_transcript",
         "voice_clone_verify_ssl",
         "voice_clone_consent",
+        "voice_region",
     ):
         st.session_state.pop(key, None)
 
@@ -574,6 +578,7 @@ def _audio_job_cache_key(
     voice_rate: str,
     vieneu_style: str = "tu_nhien",
     vieneu_service_url: str = "",
+    voice_region: str = "auto",
 ) -> str:
     narration = apply_dictionary(rec.get("narration", ""), st.session_state.dictionary)
     payload = {
@@ -583,6 +588,7 @@ def _audio_job_cache_key(
         "voice_id": voice_id,
         "voice_rate": voice_rate,
         "vieneu_style": vieneu_style,
+        "voice_region": voice_region,
         "vieneu_backend": os.getenv("VIENEU_BACKEND", "") if voice_engine == "vieneu" else "",
         "vieneu_service_url": vieneu_service_url if voice_engine == "vieneu" else "",
         "model": voice_clone_config.model if voice_clone_config else "",
@@ -721,6 +727,7 @@ def _pipeline_audio_cache_key(
     voice_rate: str,
     vieneu_style: str = "tu_nhien",
     vieneu_service_url: str = "",
+    voice_region: str = "auto",
 ) -> str:
     payload = {
         "scene_key": str(item["key"]),
@@ -730,6 +737,7 @@ def _pipeline_audio_cache_key(
         "voice_id": voice_id,
         "voice_rate": voice_rate,
         "vieneu_style": vieneu_style,
+        "voice_region": voice_region,
         "vieneu_backend": os.getenv("VIENEU_BACKEND", "") if voice_engine == "vieneu" else "",
         "vieneu_service_url": vieneu_service_url if voice_engine == "vieneu" else "",
         "model": voice_clone_config.model if voice_clone_config else "",
@@ -802,6 +810,7 @@ def _direct_voice_clone_synthesize(
     reference_text: str,
     voice_id: str,
     model: str,
+    voice_region: str,
     api_key: str,
     upload_password: str,
     voice_use_consent: bool,
@@ -840,6 +849,7 @@ def _direct_voice_clone_synthesize(
         "reference_text": reference_text or "",
         "voice_id": voice_id or "default",
         "model": model or "f5-tts",
+        "voice_region": voice_region or "auto",
         "language": "vi",
         "speed": "1.0",
         "output_format": "wav",
@@ -993,11 +1003,211 @@ def _queue_unique(items: list) -> list:
             seen.add(item)
     return result
 
+def render_usage_guide() -> None:
+    """Render the in-app usage guide without loading any model."""
+
+    has_ppt = bool(st.session_state.get("records"))
+    has_original_render = bool(st.session_state.get("original_slide_images"))
+    ppt_status = "✅ Đã nạp PowerPoint" if has_ppt else "⬜ Chưa nạp PowerPoint"
+    render_status = "✅ Có ảnh slide gốc" if has_original_render else "⬜ Chưa render slide gốc"
+
+    st.markdown(
+        """
+<style>
+.guide-hero{padding:26px 30px;border-radius:20px;color:#fff;background:linear-gradient(120deg,#172554 0%,#1d4ed8 52%,#0891b2 100%);box-shadow:0 12px 30px rgba(30,64,175,.22);margin-bottom:18px}
+.guide-hero h2{margin:0 0 7px;font-size:1.85rem;color:#fff}.guide-hero p{margin:0;color:#dbeafe;max-width:900px}
+.guide-badge{display:inline-block;padding:5px 10px;margin:13px 6px 0 0;border-radius:999px;background:rgba(255,255,255,.15);font-size:.82rem;color:#eff6ff}
+.guide-card{min-height:132px;padding:17px;border:1px solid #dbeafe;border-radius:15px;background:linear-gradient(180deg,#fff,#f8fbff);box-shadow:0 5px 16px rgba(15,23,42,.06)}
+.guide-card h4{margin:0 0 8px;color:#1e3a8a}.guide-card p{margin:0;color:#475569;font-size:.93rem;line-height:1.48}
+.guide-flow{display:flex;gap:9px;align-items:stretch;flex-wrap:wrap;margin:8px 0 18px}.guide-flow-item{flex:1 1 145px;padding:13px 14px;border-radius:13px;background:#eff6ff;border:1px solid #bfdbfe}.guide-flow-item strong{display:block;color:#1e40af;margin-bottom:4px}.guide-flow-item span{color:#475569;font-size:.88rem}
+.guide-kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#e2e8f0;border-radius:5px;padding:2px 6px;color:#0f172a}
+.guide-table{width:100%;border-collapse:collapse;font-size:.9rem}.guide-table th{background:#eff6ff;color:#1e3a8a;text-align:left}.guide-table th,.guide-table td{padding:10px;border:1px solid #dbeafe;vertical-align:top}.guide-table td{color:#334155}
+.guide-callout{padding:13px 16px;border-left:4px solid #2563eb;background:#eff6ff;border-radius:8px;color:#1e3a8a;margin:10px 0}
+.guide-danger{border-left-color:#f59e0b;background:#fffbeb;color:#92400e}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+<div class="guide-hero">
+  <h2>🎬 Hướng dẫn sử dụng PPT Video Studio</h2>
+  <p>Biến PowerPoint thành video thuyết minh có phụ đề đồng bộ, avatar và nhép môi GPU — vẫn giữ nguyên hình slide gốc.</p>
+  <span class="guide-badge">{ppt_status}</span>
+  <span class="guide-badge">{render_status}</span>
+  <span class="guide-badge">🔒 Audio local / API loopback</span>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.subheader("Bắt đầu nhanh trong 5 bước")
+    quick_steps = [
+        ("01", "Tải PPTX", "Vào tab PowerPoint, tải file và kiểm tra ảnh preview slide gốc."),
+        ("02", "Sửa Storyboard", "Chỉnh lời đọc, nhịp nghỉ, bỏ qua slide hoặc import CSV/XLSX."),
+        ("03", "Chọn giọng", "Chọn Edge, VieNeu, bản thu thật hoặc clone giọng; nhập transcript nếu có."),
+        ("04", "Cấu hình video", "Bật phụ đề, chọn màu/cỡ chữ, avatar và OpenAvatar nếu cần."),
+        ("05", "Tạo & tải", "Render audio → nhép môi → xuất MP4, SRT, script và project."),
+    ]
+    quick_cols = st.columns(5)
+    for column, (number, title, description) in zip(quick_cols, quick_steps):
+        with column:
+            st.markdown(
+                f"<div class=\"guide-card\"><h4>{number} · {title}</h4><p>{description}</p></div>",
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("### Sơ đồ pipeline")
+    st.markdown(
+        """
+<div class="guide-flow">
+  <div class="guide-flow-item"><strong>PowerPoint</strong><span>Đọc text + render ảnh slide gốc</span></div>
+  <div class="guide-flow-item"><strong>Storyboard</strong><span>Lời đọc + từ điển + nhịp nghỉ</span></div>
+  <div class="guide-flow-item"><strong>Audio</strong><span>Edge / VieNeu / recording / clone</span></div>
+  <div class="guide-flow-item"><strong>8008</strong><span>OpenAvatar nhận audio để nhép môi</span></div>
+  <div class="guide-flow-item"><strong>MP4</strong><span>Slide + audio + subtitle + avatar</span></div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("1 · Chuẩn bị PowerPoint và giữ nguyên slide gốc", expanded=True):
+        st.markdown(
+            """
+            **Thao tác:**
+
+            1. Mở tab **1. PowerPoint** và tải file `.pptx`.
+            2. Chờ bảng preview xuất hiện; kiểm tra số slide và hình nền, biểu đồ, ảnh, SmartArt.
+            3. Nếu slide gốc bị lỗi, cài Microsoft PowerPoint trên Windows hoặc LibreOffice để app có renderer dự phòng.
+            4. Không đổi tên/xóa file PPTX giữa lúc đang biên tập vì dữ liệu storyboard đang gắn với file hiện tại.
+
+            **Lưu ý:** app ưu tiên ảnh render từ PowerPoint/LibreOffice để không làm sai bố cục. Animation, transition và video nhúng trong PPT được giữ dưới dạng hình tĩnh.
+            """
+        )
+        st.markdown(
+            '<div class="guide-callout guide-danger"><b>Không thấy ảnh slide gốc?</b> Hãy render lại PPTX trên máy có PowerPoint hoặc LibreOffice trước khi xuất video. App không tự dựng lại slide từ text để tránh sai bố cục.</div>',
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("2 · Storyboard: nơi sửa lời đọc và nhịp video"):
+        st.markdown(
+            """
+            Vào tab **2. Storyboard** để:
+
+            - sửa tiêu đề và lời thuyết minh từng slide;
+            - đặt **Nghỉ sau (giây)** để tạo khoảng thở giữa các slide;
+            - đánh dấu bỏ qua slide không muốn đưa vào video;
+            - import/export CSV hoặc XLSX khi có nhiều slide;
+            - kiểm tra các từ cần đọc đặc biệt trước khi tạo audio.
+
+            Nội dung ở đây là nguồn dùng chung cho audio và phụ đề. Sửa storyboard xong nên tạo lại audio của các slide đã thay đổi.
+            """
+        )
+
+    with st.expander("3 · Chọn nguồn giọng đọc đúng nhu cầu"):
+        st.markdown(
+            """
+<table class="guide-table">
+  <tr><th>Nguồn</th><th>Khi nên dùng</th><th>Điểm cần nhớ</th></tr>
+  <tr><td><b>AI tiếng Việt</b></td><td>Cần nhanh, miễn phí, không cần GPU.</td><td>Edge TTS hiện có HoaiMy và NamMinh; lựa chọn vùng giọng hạn chế.</td></tr>
+  <tr><td><b>VieNeu-TTS local</b></td><td>Muốn nhiều preset Việt, chạy local bằng GPU.</td><td>Có preset Bắc/Nam/Trung; chọn <b>Vùng giọng / phương ngữ</b> để lọc danh sách.</td></tr>
+  <tr><td><b>Bản thu thật theo từng slide</b></td><td>Cần tự nhiên và đúng chất giọng tuyệt đối.</td><td>Đặt tên <span class="guide-kbd">slide_001.wav</span>, <span class="guide-kbd">slide_002.mp3</span>, hoặc <span class="guide-kbd">intro.wav</span>/<span class="guide-kbd">outro.wav</span>.</td></tr>
+  <tr><td><b>Nhân bản giọng từ mẫu</b></td><td>Muốn dùng giọng của mình cho text mới.</td><td>Chọn model <span class="guide-kbd">vieneu-clone</span>, mẫu 3–8 giây, bật xác nhận quyền sử dụng và chọn vùng Nam/Bắc/Trung.</td></tr>
+</table>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="guide-callout"><b>Khuyến nghị cho giọng miền Nam:</b> tải mẫu sạch, một người nói, không nhạc nền; chọn <b>Chế độ vùng giọng → Miền Nam</b>. Chế độ này giữ speaker embedding của bạn và dùng prompt vùng Nam để định hướng phát âm. Mẫu thật vẫn là yếu tố quyết định độ tự nhiên.</div>',
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("4 · Phụ đề kiểu karaoke: nói tới đâu hiện tới đó"):
+        st.markdown(
+            """
+            Trong tab **4. Xuất video**:
+
+            - bật **Đốt phụ đề vào video** để chữ nằm trực tiếp trong MP4;
+            - chọn vị trí **Dưới** hoặc **Giữa**;
+            - cỡ chữ từ **10–60 px**; nên dùng 24–34 px cho video 16:9;
+            - chọn màu nền, màu chữ, độ rộng khung theo phần trăm màn hình;
+            - chọn canh trái, giữa hoặc phải trong khung phụ đề.
+
+            Phụ đề được chia theo câu/cụm dựa trên thời lượng audio, nên không bật toàn bộ lời của slide ngay từ đầu. App đồng thời xuất file `.srt` để chỉnh tiếp trong CapCut/Premiere nếu cần.
+            """
+        )
+
+    with st.expander("5 · Nhép môi bằng OpenAvatar Runtime và GPU"):
+        st.markdown(
+            """
+            **Hai cổng có nhiệm vụ khác nhau:**
+
+            | Cổng | Nhiệm vụ | Dữ liệu gửi |
+            |---|---|---|
+            | `8009` | VieNeu tạo audio / clone giọng | text + mẫu audio |
+            | `8008` | OpenAvatar nhép môi | ảnh người dẫn + audio đã tạo |
+
+            **Cách chạy VieNeu không giữ IDE:**
+            """
+        )
+        st.code(
+            r"""cd C:\Phu\ppt-video-studio-openavatar-integrated
+.\local_voice_clone\start_vieneu_clone_8009_background.bat""",
+            language="powershell",
+        )
+        st.markdown(
+            """
+            Sau khi khởi động, kiểm tra `http://127.0.0.1:8009/health`. Service phải báo `Uvicorn running`, `engine_loaded` và `cuda_available: true` nếu dùng GPU. Không chạy đồng thời hai service khác nhau trên cùng cổng 8009.
+
+            Với OpenAvatar, chạy Runtime theo launcher của OpenAvatar SDK, nhập URL mặc định `http://127.0.0.1:8008`, bấm kiểm tra kết nối, tải ảnh người dẫn rồi chạy theo thứ tự **Audio → Nhép môi → Xuất video**.
+            """
+        )
+
+    with st.expander("6 · Tối ưu tốc độ, cache và chất lượng"):
+        st.markdown(
+            """
+            - VieNeu nạp model một lần rồi tái sử dụng cho các slide; lần đầu thường lâu hơn.
+            - Audio đã tạo được cache theo text, file mẫu, vùng giọng và model. Đổi lời đọc hoặc đổi **Miền Nam/Bắc/Trung** sẽ tạo cache mới, không lấy nhầm audio cũ.
+            - Dùng WAV mono, giọng rõ, khoảng 3–8 giây; tránh tiếng vọng, nhạc nền và nhiều người nói.
+            - Với GTX 1070 Ti 8 GB, tạo từng batch nhỏ hoặc dùng Resume Job Dashboard để tiếp tục sau khi lỗi; không bấm tạo cùng một scene nhiều lần.
+            - Khi chỉ cần thử nội dung, tạo audio trước. Chỉ chạy nhép môi sau khi nghe thử audio đạt yêu cầu.
+            """
+        )
+
+    with st.expander("7 · Xử lý lỗi nhanh"):
+        troubleshooting = [
+            ("HTTP 401", "LOCAL_API_KEY sai hoặc bỏ trống. Nhập đúng API key của service 8009; nó khác với mật khẩu mở khóa upload."),
+            ("Không kết nối 8009", "Chạy start_vieneu_clone_8009_background.bat, kiểm tra /health và đảm bảo Streamlit/Browser đang chạy trên đúng máy local."),
+            ("libtorchcodec / FFmpeg", "Khởi động bằng script VieNeu mới để dùng FFmpeg full-shared local. Các dòng lỗi cũ trong voice_clone.log không đại diện cho request mới; xem phần cuối log sau lần restart."),
+            ("Giọng Nam ra giống Bắc", "Chọn Chế độ vùng giọng → Miền Nam, dùng mẫu Southern sạch và xóa cache/audio cũ của scene nếu cần."),
+            ("Thiếu audio slide", "Kiểm tra text không rỗng; bản thu thật phải đặt đúng tên slide_001, slide_002… và đủ mọi slide có lời."),
+            ("PPT sai bố cục", "Render lại PPTX trên máy có PowerPoint/LibreOffice; không dùng slide dựng từ text."),
+            ("OpenAvatar lỗi", "Kiểm tra ảnh người dẫn, audio WAV và /health của 8008. OpenAvatar chỉ nhép môi, không tự tạo audio."),
+        ]
+        for title, detail in troubleshooting:
+            st.markdown(f"**{title}** — {detail}")
+
+    st.subheader("Checklist trước khi bấm Xuất video")
+    checklist = pd.DataFrame(
+        [
+            ["PPTX", "Đã xem preview và đủ ảnh slide gốc"],
+            ["Storyboard", "Lời đọc, từ điển và khoảng nghỉ đã kiểm tra"],
+            ["Audio", "Đã nghe thử; đúng vùng giọng và không bị cắt tiếng"],
+            ["Phụ đề", "Đã chọn cỡ chữ ≥ 10, màu, vị trí và độ rộng khung"],
+            ["Nhép môi", "8008 /health OK, ảnh người dẫn đã tải lên"],
+            ["Xuất", "Chọn MP4; tải thêm SRT, script và project để lưu cấu hình"],
+        ],
+        columns=["Hạng mục", "Kiểm tra"],
+    )
+    st.dataframe(checklist, use_container_width=True, hide_index=True)
+    st.caption("Mẹo: nếu chỉ cần video slide + thuyết minh, chọn ‘Không sử dụng’ ở phần Người dẫn để bỏ qua bước GPU 8008 và xuất nhanh hơn.")
+
+
 st.title("🎬 PPT Video Studio")
 st.caption("Chuyển PowerPoint thành video thuyết minh tiếng Việt; hỗ trợ OpenAvatar Runtime để nhép môi bằng GPU local khi app chạy trên Streamlit Cloud.")
 
-tab_upload, tab_story, tab_dict, tab_export = st.tabs([
-    "1. PowerPoint", "2. Storyboard", "3. Từ điển", "4. Xuất video"
+tab_upload, tab_story, tab_dict, tab_export, tab_guide = st.tabs([
+    "1. PowerPoint", "2. Storyboard", "3. Từ điển", "4. Xuất video", "5. Hướng dẫn"
 ])
 
 with tab_upload:
@@ -1321,6 +1531,9 @@ with tab_export:
         voice_id = "vi-VN-HoaiMyNeural"
         voice_rate = "+0%"
         vieneu_style = "tu_nhien"
+        voice_region = normalize_voice_region(
+            os.getenv("VIENEU_VOICE_REGION", "auto")
+        )
         vieneu_service_url = os.getenv(
             "VIENEU_SERVICE_URL", "http://127.0.0.1:8009"
         ).strip().rstrip("/")
@@ -1357,7 +1570,7 @@ with tab_export:
             st.caption(
                 "Browser Bridge sẽ gọi VieNeu-TTS trên service local, không chạy model "
                 "trong Streamlit Cloud. Nếu service 8009 chạy bằng "
-                "start_f5_8009.bat, nhập LOCAL_API_KEY ở ô dưới."
+                "start_vieneu_clone_8009.bat, nhập LOCAL_API_KEY ở ô dưới."
             )
             vieneu_service_url = st.text_input(
                 "VieNeu local service URL",
@@ -1376,7 +1589,7 @@ with tab_export:
                 key="vieneu_service_api_key",
                 help=(
                     "Phải trùng LOCAL_API_KEY của service 8009 nếu bạn chạy "
-                    "start_f5_8009.bat; có thể đặt VIENEU_SERVICE_API_KEY "
+                    "start_vieneu_clone_8009.bat; có thể đặt VIENEU_SERVICE_API_KEY "
                     "hoặc VOICE_CLONE_API_KEY trong Streamlit secrets."
                 ),
             ).strip()
@@ -1388,6 +1601,16 @@ with tab_export:
                 help=(
                     "Một số bản VieNeu v3 Turbo đã mã hóa phong cách trong giọng preset "
                     "và có thể bỏ qua tùy chọn này."
+                ),
+            )
+            voice_region = st.selectbox(
+                "Vùng giọng / phương ngữ",
+                options=list(VIENEU_VOICE_REGIONS),
+                format_func=lambda region: VIENEU_VOICE_REGIONS[region],
+                key="voice_region",
+                help=(
+                    "Với giọng preset, danh sách sẽ lọc theo vùng. Với file mẫu, "
+                    "VieNeu giữ chất giọng của bạn và dùng prompt vùng để định hướng phát âm."
                 ),
             )
             voice_list_result = local_gpu_bridge(
@@ -1421,6 +1644,23 @@ with tab_export:
                         vieneu_voices = list_vieneu_voices()
                     except Exception as exc:
                         st.error(f"Không đọc được danh sách giọng VieNeu-TTS: {exc}")
+
+            if vieneu_voices and voice_region != "auto":
+                region_marker = {
+                    "nam": "· Nam ·",
+                    "bac": "· Bắc ·",
+                    "trung": "· Trung ·",
+                }[voice_region]
+                filtered_voices = [
+                    item for item in vieneu_voices if region_marker in item[0]
+                ]
+                if filtered_voices:
+                    vieneu_voices = filtered_voices
+                else:
+                    st.warning(
+                        "Không nhận được metadata vùng cho danh sách preset; "
+                        "đang hiển thị toàn bộ giọng để bạn chọn thủ công."
+                    )
 
             if vieneu_voices:
                 voice_options = [voice_key for _, voice_key in vieneu_voices]
@@ -1456,12 +1696,12 @@ with tab_export:
                     ):
                         st.warning(
                             "Đã gọi được service 8009 nhưng model VieNeu chưa sẵn sàng. "
-                            "Khởi động lại start_f5_8009.bat sau khi tải model rồi tải lại trang."
+                            "Khởi động lại start_vieneu_clone_8009.bat sau khi tải model rồi tải lại trang."
                         )
                     else:
                         st.warning(
                             "Chưa kết nối được VieNeu local service. Hãy chạy "
-                            "local_voice_clone/start_f5_8009.bat rồi tải lại trang."
+                            "local_voice_clone/start_vieneu_clone_8009.bat rồi tải lại trang."
                         )
                     st.caption(vieneu_error)
                 elif not vieneu_direct_python:
@@ -1496,7 +1736,7 @@ with tab_export:
             voice_engine = "voice_clone"
             if voice_upload_unlocked:
                 clone_sample = st.file_uploader(
-                    "Tải mẫu giọng (khuyến nghị 15–60 giây, rõ tiếng, một người nói)",
+                    "Tải mẫu giọng (khuyến nghị 3–8 giây, rõ tiếng, một người nói)",
                     type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
                     key="voice_clone_reference",
                 )
@@ -1510,8 +1750,12 @@ with tab_export:
                 )
                 clone_model = model_col.text_input(
                     "Model",
-                    value=os.getenv("VOICE_CLONE_MODEL", "f5-tts"),
-                    help="Đang dùng start_f5_8009.bat nên chọn f5-tts; chỉ chọn vira-tts khi service Vira đang chạy.",
+                    value=os.getenv("VOICE_CLONE_MODEL", "vieneu-clone"),
+                    help=(
+                        "Khuyên dùng vieneu-clone: clone giọng tiếng Việt bằng VieNeu v3 Turbo, "
+                        "chạy GPU local qua start_vieneu_clone_8009.bat. f5-tts mặc định chỉ phù hợp "
+                        "Trung/Anh; vira-tts hỗ trợ tiếng Việt nhưng thường chậm hơn."
+                    ),
                     key="voice_clone_model",
                 )
                 clone_api_key = st.text_input(
@@ -1520,7 +1764,7 @@ with tab_export:
                     type="password",
                     key="voice_clone_api_key",
                     help=(
-                        "Phải trùng LOCAL_API_KEY trong start_f5_8009.bat "
+                        "Phải trùng LOCAL_API_KEY trong start_vieneu_clone_8009.bat "
                         "(hoặc biến môi trường của service). Không nhập mật "
                         "khẩu mở khóa upload vào ô này."
                     ),
@@ -1542,6 +1786,17 @@ with tab_export:
                     help="Một số model clone giọng dùng transcript này để tăng độ chính xác.",
                     key="voice_clone_transcript",
                 )
+                voice_region = st.selectbox(
+                    "Chế độ vùng giọng",
+                    options=list(VIENEU_VOICE_REGIONS),
+                    format_func=lambda region: VIENEU_VOICE_REGIONS[region],
+                    key="voice_region",
+                    help=(
+                        "Chọn Miền Nam nếu bạn nói giọng Nam. VieNeu v3 Turbo sẽ giữ "
+                        "speaker embedding của file mẫu và dùng prompt vùng Nam, "
+                        "tránh rơi về preset Bắc mặc định."
+                    ),
+                )
                 clone_verify_ssl = st.checkbox("Xác minh SSL", value=True, key="voice_clone_verify_ssl")
                 voice_clone_consent = st.checkbox(
                     "Tôi xác nhận mình sở hữu giọng này hoặc có sự đồng ý rõ ràng của người sở hữu giọng.",
@@ -1555,6 +1810,7 @@ with tab_export:
                         reference_audio=clone_sample.getvalue(),
                         reference_filename=clone_sample.name,
                         model=clone_model,
+                        voice_region=voice_region,
                         api_key=clone_api_key,
                         reference_transcript=clone_transcript,
                         voice_use_consent=voice_clone_consent,
@@ -1786,6 +2042,7 @@ with tab_export:
                                         voice_id=voice_id,
                                         voice_rate=voice_rate,
                                         vieneu_style=vieneu_style,
+                                        voice_region=voice_region,
                                         voice_clone_config=voice_clone_config,
                                         uploaded_audio=audio_asset_for_scene(preview_scene, recorded_voice_assets),
                                     )
@@ -2129,6 +2386,7 @@ with tab_export:
                             voice_rate,
                             vieneu_style,
                             vieneu_service_url,
+                            voice_region,
                         )
                         if key not in st.session_state.local_avatar_audio:
                             try:
@@ -2306,6 +2564,7 @@ with tab_export:
                         voice_rate,
                         vieneu_style,
                         vieneu_service_url,
+                        voice_region,
                     )
                     # Re-check persistent disk cache immediately before making
                     # an expensive GPU request. This protects against Streamlit
@@ -2369,6 +2628,7 @@ with tab_export:
                                 reference_text=voice_clone_config.reference_transcript or "",
                                 voice_id="default",
                                 model=voice_clone_config.model or "f5-tts",
+                                voice_region=voice_clone_config.voice_region or voice_region,
                                 api_key=voice_clone_config.api_key or "",
                                 upload_password=voice_clone_config.upload_password or "",
                                 voice_use_consent=bool(
@@ -2389,6 +2649,7 @@ with tab_export:
                                 reference_text=voice_clone_config.reference_transcript or "",
                                 voice_id="default",
                                 model=voice_clone_config.model or "f5-tts",
+                                voice_region=voice_clone_config.voice_region or voice_region,
                                 api_key=voice_clone_config.api_key or "",
                                 voice_use_consent=bool(
                                     voice_clone_config.voice_use_consent
@@ -2407,6 +2668,7 @@ with tab_export:
                             voice_id=voice_id or "default",
                             model="vieneu",
                             voice_style=vieneu_style,
+                            voice_region=voice_region,
                             request_id=f"voice-scene-{current_key}",
                             cache_key=audio_cache_key,
                             key=f"vieneu_scene_{current_key}",
@@ -2439,6 +2701,7 @@ with tab_export:
                                     voice_id=voice_id,
                                     voice_rate=voice_rate,
                                     vieneu_style=vieneu_style,
+                                    voice_region=voice_region,
                                     uploaded_audio=uploaded_asset,
                                 )
                                 audio_bytes = generated_path.read_bytes() if generated_path else b""
@@ -2897,6 +3160,7 @@ with tab_export:
                         voice_id=voice_id or "default",
                         model="vieneu",
                         voice_style=vieneu_style,
+                        voice_region=voice_region,
                         storyboard=batch_items,
                         request_id="vieneu-export-batch",
                         key="vieneu_export_batch",
@@ -3088,6 +3352,7 @@ with tab_export:
                             voice_engine=export_voice_engine, voice_id=voice_id,
                             voice_rate=voice_rate,
                             vieneu_style=vieneu_style,
+                            voice_region=voice_region,
                             voice_clone_config=export_voice_clone_config,
                             scene_audio_assets=scene_audio_assets,
                             slide_images=images, burn_subtitles=burn_subtitles,
@@ -3113,6 +3378,7 @@ with tab_export:
                                 "voice_id": voice_id if voice_engine in {"edge", "vieneu"} else None,
                                 "voice_rate": voice_rate if voice_engine == "edge" else None,
                                 "voice_style": vieneu_style if voice_engine == "vieneu" else None,
+                                "voice_region": voice_region if voice_engine in {"vieneu", "voice_clone"} else None,
                                 "voice_clone_model": voice_clone_config.model if voice_clone_config else None,
                                 "has_recorded_audio": bool(recorded_voice_assets),
                             },
@@ -3143,3 +3409,7 @@ with tab_export:
                             "Sửa lỗi cấu hình rồi app sẽ thử xuất lại; "
                             "audio/clip đã render không bị mất."
                         )
+
+
+with tab_guide:
+    render_usage_guide()

@@ -189,6 +189,7 @@ async function execute(){
         model:'vieneu',
         voice_id:args.voice_id||'default',
         voice_style:args.voice_style||'tu_nhien',
+        voice_region:args.voice_region||'auto',
         language:'vi', speed:1.0, output_format:'wav', continue_on_error:false,
         slides:items.map((item,index)=>({slide:index+1,text:item.text||''}))
       };
@@ -247,6 +248,7 @@ async function execute(){
       fd.append('voice_id',args.voice_id||'default');
       fd.append('model',args.model||'f5-tts');
       fd.append('voice_style',args.voice_style||'tu_nhien');
+      fd.append('voice_region',args.voice_region||'auto');
       if(args.reference_text) fd.append('reference_text',args.reference_text);
       fd.append('voice_use_consent', args.voice_use_consent ? 'true' : 'false');
       fd.append('language','vi');
@@ -270,7 +272,7 @@ async function execute(){
           try{ detail=await r.text(); }catch(__){}
         }
         const authHint=r.status===401
-          ? ' Service 8009 yêu cầu LOCAL_API_KEY; hãy nhập đúng key của start_f5_8009.bat vào ô API key.'
+          ? ' Service 8009 yêu cầu LOCAL_API_KEY; hãy nhập đúng key của start_vieneu_clone_8009.bat vào ô API key.'
           : '';
         throw new Error('HTTP '+r.status+(detail ? ': '+detail : '')+authHint);
       }

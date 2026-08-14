@@ -18,6 +18,8 @@ from .logging_service import configure_logging
 from .text_normalizer import VietnameseTextNormalizer, chunk_text
 from .voice_profile_service import VoiceProfile, VoiceProfileService
 
+from src.vieneu_tts import regional_prompt_voice_id
+
 
 @dataclass(frozen=True)
 class SynthesisResult:
@@ -34,6 +36,7 @@ class SynthesisResult:
     normalized_text: str
     queue_wait_seconds: float = 0.0
     total_seconds: float = 0.0
+    voice_region: str = "auto"
 
     def to_dict(self, *, audio_url: str | None = None) -> dict[str, Any]:
         output = {
@@ -50,6 +53,7 @@ class SynthesisResult:
             "inference_seconds": round(self.inference_seconds, 3),
             "queue_wait_seconds": round(self.queue_wait_seconds, 3),
             "total_seconds": round(self.total_seconds, 3),
+            "voice_region": self.voice_region,
         }
         if audio_url:
             output["audio_url"] = audio_url
@@ -78,7 +82,13 @@ class SynthesisService:
         raw = (model or (profile.engine if profile else default_engine) or default_engine).strip().lower()
         if raw in {"f5-tts", "f5tts", "f5_tts", "f5tts_v1_base", "f5-tts-v1-base"}:
             return "f5-tts"
-        if raw in {"vieneu", "vieneu-tts", "vieneu_tts"}:
+        if raw in {
+            "vieneu",
+            "vieneu-tts",
+            "vieneu_tts",
+            "vieneu-clone",
+            "vieneu_clone",
+        }:
             return "vieneu"
         return raw
 
@@ -187,17 +197,26 @@ class SynthesisService:
         language: str,
         speed: float,
         temporary_dir: Path,
+        voice_region: str = "auto",
     ) -> Path:
+        temporary_dir.mkdir(parents=True, exist_ok=True)
         paths: list[Path] = []
         for index, (chunk, _) in enumerate(chunks, start=1):
             target = temporary_dir / f"chunk_{index:03}.wav"
+            synthesize_kwargs = {
+                "language": language,
+                "speed": speed,
+            }
+            if voice_region != "auto":
+                # Only the VieNeu clone engine consumes this optional
+                # argument. F5/Vira callers keep the legacy contract.
+                synthesize_kwargs["voice_region"] = voice_region
             engine.synthesize(
                 chunk,
                 reference_audio,
                 reference_text,
                 target,
-                language=language,
-                speed=speed,
+                **synthesize_kwargs,
             )
             if not target.exists() or target.stat().st_size == 0:
                 raise RuntimeError(f"Engine không sinh được chunk {index}.")
@@ -221,6 +240,7 @@ class SynthesisService:
         speed: float,
         temporary_dir: Path,
     ) -> Path:
+        temporary_dir.mkdir(parents=True, exist_ok=True)
         synthesize_with_voice = getattr(engine, "synthesize_with_voice", None)
         if not callable(synthesize_with_voice):
             raise RuntimeError("VieNeu engine không hỗ trợ preset voice.")
@@ -267,17 +287,41 @@ class SynthesisService:
         *,
         normalized_text: str,
         voice_id: str | None,
+        reference_audio: str | Path | None,
+        reference_text: str | None,
         voice_style: str,
+        voice_region: str,
         language: str,
         speed: float,
         selected_format: str,
         output_dir: str | Path | None,
         output_name: str | None,
     ) -> SynthesisResult:
-        """Synthesize a preset voice without touching reference-profile code."""
+        """Synthesize a VieNeu preset or a Vietnamese reference clone.
+
+        VieNeu v3 Turbo accepts ``ref_audio`` directly.  Keeping this path in
+        the VieNeu-specific method is important: it lets preset voices keep
+        their existing API while avoiding the generic F5/Vira profile path for
+        a clone request.
+        """
 
         selected_engine = "vieneu"
-        effective_voice_id = voice_id or "default"
+        clone_mode = reference_audio is not None
+        requested_region = str(voice_region or "auto").strip().lower()
+        regional_default_voice = (
+            regional_prompt_voice_id(requested_region)
+            if requested_region != "auto"
+            else ""
+        )
+        effective_voice_id = (
+            "uploaded"
+            if clone_mode
+            else (
+                regional_default_voice
+                if regional_default_voice and (not voice_id or voice_id.lower() in {"default", "auto"})
+                else (voice_id or "default")
+            )
+        )
         effective_style = (voice_style or "tu_nhien").strip() or "tu_nhien"
         effective_language = language or "vi"
         request_id = str(uuid.uuid4())
@@ -286,6 +330,15 @@ class SynthesisService:
         destination = self._safe_output_path(destination_dir, output_name or request_id, selected_format)
         warnings: list[str] = []
         started_at = time.perf_counter()
+
+        reference_source: Path | None = None
+        if clone_mode:
+            reference_source = Path(reference_audio).expanduser().resolve()
+            if not reference_source.is_file():
+                raise VoiceCloneServiceError(
+                    "REFERENCE_AUDIO_NOT_FOUND",
+                    f"Không tìm thấy file mẫu giọng: {reference_source}",
+                )
 
         try:
             with self._inference_lock:
@@ -298,11 +351,24 @@ class SynthesisService:
 
         temporary_dir = Path(tempfile.mkdtemp(prefix="vieneu_", dir=self.settings.temp_dir))
         try:
+            prepared_reference: Path | None = None
+            if reference_source is not None:
+                prepared_reference = temporary_dir / "reference.wav"
+                self.audio.preprocess_reference(reference_source, prepared_reference)
+
             cache_key = self.cache.build_key(
                 {
                     "engine": selected_engine,
+                    "mode": "clone" if clone_mode else "preset",
                     "voice_id": effective_voice_id,
                     "voice_style": effective_style,
+                    "voice_region": voice_region,
+                    "reference_audio_hash": (
+                        self.cache.hash_file(prepared_reference)
+                        if prepared_reference is not None
+                        else ""
+                    ),
+                    "reference_text": reference_text or "",
                     "text": normalized_text,
                     "language": effective_language,
                     "speed": float(speed),
@@ -327,9 +393,17 @@ class SynthesisService:
                     normalized_text=normalized_text,
                     queue_wait_seconds=0.0,
                     total_seconds=elapsed,
+                    voice_region=voice_region,
                 )
 
-            chunks = chunk_text(normalized_text, self.settings.max_chars_per_chunk)
+            # VieNeu v3 Turbo performs its own reference-aware chunking.  A
+            # single service chunk avoids re-encoding the sample voice for
+            # every sentence and is substantially faster for one slide.
+            chunks = (
+                [(normalized_text, False)]
+                if clone_mode
+                else chunk_text(normalized_text, self.settings.max_chars_per_chunk)
+            )
             if not chunks:
                 raise VoiceCloneServiceError("TEXT_EMPTY", "Không tách được text thành chunk.")
 
@@ -338,15 +412,27 @@ class SynthesisService:
                 queue_wait_seconds = time.perf_counter() - queue_started
                 inference_started = time.perf_counter()
                 try:
-                    generated_wav = self._render_vieneu_chunks(
-                        engine=engine,
-                        chunks=chunks,
-                        voice_id=voice_id or "",
-                        style=effective_style,
-                        language=effective_language,
-                        speed=float(speed),
-                        temporary_dir=temporary_dir,
-                    )
+                    if clone_mode:
+                        generated_wav = self._render_chunks(
+                            engine=engine,
+                            chunks=chunks,
+                            reference_audio=prepared_reference,
+                            reference_text=reference_text,
+                            language=effective_language,
+                            speed=float(speed),
+                            temporary_dir=temporary_dir,
+                            voice_region=voice_region,
+                        )
+                    else:
+                        generated_wav = self._render_vieneu_chunks(
+                            engine=engine,
+                            chunks=chunks,
+                            voice_id=effective_voice_id,
+                            style=effective_style,
+                            language=effective_language,
+                            speed=float(speed),
+                            temporary_dir=temporary_dir,
+                        )
                 except Exception as exc:
                     if not self._is_oom(exc):
                         raise
@@ -356,15 +442,27 @@ class SynthesisService:
                         max(50, self.settings.max_chars_per_chunk // 2),
                     )
                     try:
-                        generated_wav = self._render_vieneu_chunks(
-                            engine=engine,
-                            chunks=smaller_chunks,
-                            voice_id=voice_id or "",
-                            style=effective_style,
-                            language=effective_language,
-                            speed=float(speed),
-                            temporary_dir=temporary_dir / "oom_retry",
-                        )
+                        if clone_mode:
+                            generated_wav = self._render_chunks(
+                                engine=engine,
+                                chunks=smaller_chunks,
+                                reference_audio=prepared_reference,
+                                reference_text=reference_text,
+                                language=effective_language,
+                                speed=float(speed),
+                                temporary_dir=temporary_dir / "oom_retry",
+                                voice_region=voice_region,
+                            )
+                        else:
+                            generated_wav = self._render_vieneu_chunks(
+                                engine=engine,
+                                chunks=smaller_chunks,
+                                voice_id=effective_voice_id,
+                                style=effective_style,
+                                language=effective_language,
+                                speed=float(speed),
+                                temporary_dir=temporary_dir / "oom_retry",
+                            )
                         warnings.append("GPU_OOM_RETRIED_WITH_SMALLER_CHUNKS")
                     except Exception as retry_exc:
                         raise VoiceCloneServiceError(
@@ -391,6 +489,7 @@ class SynthesisService:
                 "model": selected_engine,
                 "voice_id": effective_voice_id,
                 "voice_style": effective_style,
+                "voice_region": voice_region,
                 "output_format": selected_format,
             }
             self.cache.store(cache_key, selected_format, destination, metadata)
@@ -408,6 +507,7 @@ class SynthesisService:
                 normalized_text=normalized_text,
                 queue_wait_seconds=queue_wait_seconds,
                 total_seconds=total_seconds,
+                voice_region=voice_region,
             )
         except VoiceCloneServiceError:
             raise
@@ -426,6 +526,7 @@ class SynthesisService:
         reference_audio: str | Path | None = None,
         reference_text: str | None = None,
         voice_style: str = "tu_nhien",
+        voice_region: str = "auto",
         language: str = "vi",
         speed: float = 1.0,
         output_format: str = "wav",
@@ -448,7 +549,10 @@ class SynthesisService:
             return self._synthesize_vieneu(
                 normalized_text=normalized_text,
                 voice_id=voice_id,
+                reference_audio=reference_audio,
+                reference_text=reference_text,
                 voice_style=voice_style,
+                voice_region=voice_region,
                 language=language,
                 speed=float(speed),
                 selected_format=selected_format,

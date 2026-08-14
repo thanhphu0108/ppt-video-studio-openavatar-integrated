@@ -96,12 +96,13 @@ textarea{min-height:155px;resize:vertical} .grid{display:grid;grid-template-colu
 </style></head><body><main>
 <h1>Local Voice Clone</h1><p class="help">Chạy hoàn toàn trên máy này. Không tải audio hoặc nội dung lên cloud.</p>
 <div id="health" class="status">Đang kiểm tra service…</div>
-<form id="form"><div class="grid"><label>Model<select name="model"><option value="f5-tts">F5-TTS</option><option value="dummy">Dummy (chỉ kiểm thử)</option></select></label>
+<form id="form"><div class="grid"><label>Model<select name="model"><option value="vieneu-clone">VieNeu v3 Turbo — clone tiếng Việt</option><option value="f5-tts">F5-TTS (Trung/Anh)</option><option value="dummy">Dummy (chỉ kiểm thử)</option></select></label>
 <label>Voice profile<select id="voice" name="voice_id"><option value="">-- dùng audio upload --</option></select></label></div>
 <label>Reference audio (WAV, MP3, M4A, AAC, OGG, FLAC)<input type="file" name="reference_audio" accept=".wav,.mp3,.m4a,.aac,.ogg,.flac,audio/*"></label>
 <label>Mật khẩu để dùng giọng tải lên<input id="uploadPassword" type="password" autocomplete="current-password"></label>
 <label class="help"><input name="voice_use_consent" type="checkbox" value="true" style="width:auto"> Tôi xác nhận có quyền sử dụng giọng nói mẫu này.</label>
 <label>Reference transcript <span class="help">(khuyến nghị nhập đúng lời trong file mẫu)</span><textarea name="reference_text" style="min-height:72px"></textarea></label>
+<label>Vùng giọng / phương ngữ<select name="voice_region"><option value="auto">Tự động — giữ vùng theo file mẫu</option><option value="nam">Miền Nam</option><option value="bac">Miền Bắc</option><option value="trung">Miền Trung</option></select></label>
 <label>Text tiếng Việt cần đọc<textarea name="text" required placeholder="Kính thưa quý anh chị…"></textarea></label>
 <div class="grid"><label>Speed<input name="speed" type="number" min="0.5" max="2" step="0.05" value="1"></label><label>Định dạng<select name="output_format"><option value="wav">WAV (khuyến nghị cho Wav2Lip)</option><option value="mp3">MP3 192 kbps</option></select></label></div>
 <input name="language" type="hidden" value="vi"><button id="generate" type="submit">Generate local audio</button></form>
@@ -188,6 +189,7 @@ def create_router(service: SynthesisService, settings: Settings) -> APIRouter:
                 reference_audio=uploaded_reference,
                 reference_text=payload.reference_text,
                 voice_style=payload.voice_style,
+                voice_region=payload.voice_region,
                 language=payload.language,
                 speed=payload.speed,
                 output_format=payload.output_format,
@@ -229,6 +231,7 @@ def create_router(service: SynthesisService, settings: Settings) -> APIRouter:
                     text=item.text,
                     reference_text=payload.reference_text,
                     voice_style=payload.voice_style,
+                    voice_region=payload.voice_region,
                     language=payload.language,
                     speed=payload.speed,
                     output_format=payload.output_format,
@@ -253,6 +256,7 @@ def create_router(service: SynthesisService, settings: Settings) -> APIRouter:
         manifest = {
             "run_id": run_id,
             "voice_id": payload.voice_id,
+            "voice_region": payload.voice_region,
             "model": payload.model,
             "slides": files,
         }

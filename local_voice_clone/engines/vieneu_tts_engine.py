@@ -19,6 +19,7 @@ from src.vieneu_tts import (  # noqa: E402
     DEFAULT_STYLE,
     list_vieneu_voices,
     get_vieneu_engine,
+    DEFAULT_VOICE_REGION,
     synthesize_vieneu_audio,
     vieneu_available,
     vieneu_install_hint,
@@ -26,12 +27,11 @@ from src.vieneu_tts import (  # noqa: E402
 
 
 class VieneuTTSEngine(VoiceCloneEngine):
-    """VieNeu preset-voice engine used by the browser-facing local service.
+    """VieNeu v3 Turbo preset and Vietnamese reference-clone engine.
 
-    Unlike F5-TTS, VieNeu preset voices do not need a reference recording.  The
-    service still exposes the common ``VoiceCloneEngine`` contract so the
-    existing health/model routing can use it, while ``synthesize_with_voice``
-    carries the preset voice and reading style explicitly.
+    ``synthesize_with_voice`` keeps the built-in preset path, while the common
+    ``synthesize`` contract passes a reference recording to v3 Turbo's
+    zero-shot ``ref_audio`` argument.
     """
 
     id = "vieneu"
@@ -84,15 +84,25 @@ class VieneuTTSEngine(VoiceCloneEngine):
         output_path: str | Path,
         language: str = "vi",
         speed: float = 1.0,
+        voice_region: str = DEFAULT_VOICE_REGION,
     ) -> str:
-        del reference_audio
-        return self.synthesize_with_voice(
-            text=text,
-            voice_id=reference_text or "",
-            output_path=output_path,
-            language=language,
-            speed=speed,
+        self.load()
+        generated = synthesize_vieneu_audio(
+            text,
+            output_path,
+            # A reference audio takes precedence over a preset voice.  This
+            # is the Vietnamese zero-shot clone path used by model=
+            # "vieneu-clone" in the API.
+            voice="" if reference_audio is not None else (reference_text or ""),
+            style=DEFAULT_STYLE,
+            backend=self.backend,
+            reference_audio=reference_audio,
+            reference_text=reference_text,
+            voice_region=voice_region,
         )
+        if generated is None:
+            raise RuntimeError("VieNeu-TTS không nhận được nội dung cần đọc.")
+        return str(generated)
 
     def status(self) -> EngineStatus:
         available = vieneu_available()
@@ -104,4 +114,3 @@ class VieneuTTSEngine(VoiceCloneEngine):
             model="VieNeu-TTS v3 Turbo",
             message="" if available else vieneu_install_hint(),
         )
-

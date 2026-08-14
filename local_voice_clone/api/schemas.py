@@ -10,6 +10,7 @@ class SynthesisRequest(BaseModel):
 
     model: str = "f5-tts"
     voice_id: str | None = None
+    voice_region: Literal["auto", "nam", "bac", "trung"] = "auto"
     text: str
     reference_text: str | None = None
     # The existing PPT app calls this field `reference_transcript`; keep it
@@ -35,6 +36,7 @@ class StoryboardSynthesisRequest(BaseModel):
     model: str = "f5-tts"
     voice_id: str = "default"
     voice_style: str = "tu_nhien"
+    voice_region: Literal["auto", "nam", "bac", "trung"] = "auto"
     reference_text: str | None = None
     language: str = "vi"
     speed: float = Field(default=1.0, ge=0.5, le=2.0)

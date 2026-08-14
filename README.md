@@ -14,7 +14,7 @@
 - Import/export từ điển.
 - Kiểm duyệt từ ngữ không phù hợp khi thêm, import và render.
 - Chọn slide PowerPoint, slide hệ thống hoặc ảnh tải lên làm intro/outro, mỗi loại đều có lời thuyết minh riêng.
-- Bốn nguồn giọng: Edge TTS, VieNeu-TTS local, bản thu thật theo từng slide và nhân bản giọng local F5-TTS qua API riêng có xác nhận quyền sử dụng giọng.
+- Bốn nguồn giọng: Edge TTS, VieNeu-TTS local, bản thu thật theo từng slide và nhân bản giọng tiếng Việt bằng VieNeu v3 Turbo qua API riêng có xác nhận quyền sử dụng giọng.
 - Các luồng tải audio giọng được bảo vệ bằng mật khẩu theo phiên sử dụng.
 - Phụ đề đốt vào video và file SRT.
 - Phụ đề đốt chạy kiểu karaoke theo cụm ngắn, cố định khung và tự ẩn sau lời nói; cỡ chữ cấu hình từ 10 px.
@@ -48,7 +48,7 @@ Voice clone là service riêng, không phải OpenAvatar Runtime:
 Storyboard / lời thuyết minh
               │
               ▼
-Local Voice Service (F5-TTS / VieNeu-TTS)
+Local Voice Service (VieNeu v3 Turbo / F5-TTS / Vira-TTS)
 http://127.0.0.1:8009
               │ WAV mono
               ▼
@@ -65,6 +65,15 @@ dẫn cài Local Voice Clone Service ở [local_voice_clone/README.md](local_voi
 VieNeu cũng đi qua service `8009`: Browser Bridge gửi text/voice ID từ trình
 duyệt tới service local, service nạp model và GPU trên máy người dùng rồi trả
 WAV về Streamlit. Vì vậy Streamlit Cloud không cần cài hoặc tải model VieNeu.
+
+Để nhân bản giọng tiếng Việt nhanh, chạy
+`local_voice_clone/start_vieneu_clone_8009.bat`, sau đó chọn nguồn **Nhân bản
+giọng từ mẫu (API riêng)** và model `vieneu-clone`. Trong ô **Chế độ vùng giọng**,
+chọn **Miền Nam/Bắc/Trung**. VieNeu giữ speaker embedding của file mẫu và dùng
+reference codes của prompt vùng đã chọn để tránh rơi về preset Bắc mặc định. Mẫu
+3–8 giây, nạp model một lần và tái sử dụng cho các slide. `f5-tts` hiện là
+checkpoint Trung/Anh; `vira-tts` vẫn giữ làm phương án tiếng Việt dự phòng
+nhưng thường chậm hơn.
 
 Streamlit Cloud không gọi trực tiếp `localhost`. Custom Streamlit Component trong repository này thực hiện request từ trình duyệt:
 
@@ -100,8 +109,11 @@ VieNeu-TTS hiện yêu cầu Python 3.10+ và được cài trong môi trường
 ```bat
 cd local_voice_clone
 python -m pip install -r requirements.txt
-start.bat
+start_vieneu_clone_8009.bat
 ```
+
+Để không giữ terminal/IDE, có thể chạy `start_vieneu_clone_8009_background.bat`;
+log service nằm trong `local_voice_clone/logs/`.
 
 Nếu môi trường local đã cài service trước đó, cập nhật riêng:
 
@@ -109,7 +121,9 @@ Nếu môi trường local đã cài service trước đó, cập nhật riêng:
 python -m pip install -U vieneu
 ```
 
-Có thể đặt `VIENEU_BACKEND=onnx` để buộc backend ONNX/CPU. Để chạy VieNeu
+Mặc định script clone dùng `VIENEU_BACKEND=pytorch` để tận dụng GPU. Có thể đặt
+`VIENEU_BACKEND=onnx` để buộc backend ONNX/CPU cho giọng preset; backend ONNX
+không phải lựa chọn clone GPU chính. Để chạy VieNeu
 trực tiếp trong Python của Streamlit local (không khuyến nghị khi deploy Cloud),
 đặt `VIENEU_DIRECT_PYTHON=true`.
 

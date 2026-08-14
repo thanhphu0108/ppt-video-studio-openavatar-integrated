@@ -1118,6 +1118,29 @@ def render_usage_guide() -> None:
             unsafe_allow_html=True,
         )
         st.markdown(
+            """
+            #### Quy trình dùng bản thu thật theo từng slide
+
+            1. Trong **4. Xuất video**, chọn **Nguồn giọng đọc → Bản thu thật theo từng slide**.
+            2. Mở khóa tải giọng nếu app yêu cầu mật khẩu, rồi tải nhiều file audio cùng lúc.
+            3. Đặt tên file theo đúng số slide: `slide_001.wav`, `slide_002.mp3`, `slide_003.m4a`…
+               Có thể dùng thêm `intro.wav` và `outro.wav` cho phần mở đầu/kết thúc.
+            4. Kiểm tra thông báo **Đã nhận bản thu cho...**. Mỗi slide có lời đọc phải có đúng một file.
+            5. Bấm tạo audio/preview hoặc xuất video. App dùng nguyên bản thu, không gọi TTS và không gửi mẫu giọng đi để clone.
+
+            Nếu muốn cắt từ một file dài, vào **Storyboard → Audio ngoài theo từng slide / cắt từ một bản thu dài**,
+            tải bản thu dài, bật từng scene và nhập mốc **MM:SS** hoặc **HH:MM:SS**. Bấm **Áp dụng timecode** để cắt
+            và gán audio vào từng slide. Audio đã gán được ưu tiên hơn AI và bản thu upload theo tên.
+
+            **Khi dùng với OpenAvatar:** bản thu thật tạo audio ngay trong app; chỉ cần cổng `8008` để nhép môi.
+            Không cần Voice Clone API hoặc cổng `8009` cho luồng này.
+            """
+        )
+        st.markdown(
+            '<div class="guide-callout"><b>Checklist nhanh:</b> file không rỗng · tên có đủ số slide · định dạng mp3/wav/m4a/aac/ogg/flac · giọng sạch, không nhạc nền · nghe thử trước khi nhép môi.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
             '<div class="guide-callout"><b>Khuyến nghị cho giọng miền Nam:</b> tải mẫu sạch, một người nói, không nhạc nền; chọn <b>Chế độ vùng giọng → Miền Nam</b>. Chế độ này giữ speaker embedding của bạn và dùng prompt vùng Nam để định hướng phát âm. Mẫu thật vẫn là yếu tố quyết định độ tự nhiên.</div>',
             unsafe_allow_html=True,
         )
